@@ -1,0 +1,11 @@
+# Build outputs
+*.o
+*.out
+my_program
+**/my_program
+a.out
+
+# Editor / OS
+*.swp
+*~
+.DS_Store
