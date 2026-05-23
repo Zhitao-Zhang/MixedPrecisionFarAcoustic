@@ -10,7 +10,7 @@
 #include <time.h>
 #define PI 3.1415926535
 #define e 2.718281828
-#define NZ 320	
+#define NZ 128	
 #define NY 128   //此处是y轴的网格点数量
 #define NX 128
 #define NP 32
@@ -501,42 +501,42 @@ int main()
 			}
 		}
 	}
-	char rho_tempxname[] = "rho_tempx.dat";
-	wfile3d(rho_tempxname, rho_tempx, NZ_ext, NY_ext, NX_ext);
-	char rho_tempyname[] = "rho_tempy.dat";
-	wfile3d(rho_tempyname, rho_tempy, NZ_ext, NY_ext, NX_ext);
-	char rho_tempzname[] = "rho_tempz.dat";
-	wfile3d(rho_tempzname, rho_tempz, NZ_ext, NY_ext, NX_ext);
-	char muxzname[] = "muxz.dat";
-	wfile3d(muxzname, muxz, NZ_ext, NY_ext, NX_ext);
-	char muxyname[] = "muxy.dat";
-	wfile3d(muxyname, muxy, NZ_ext, NY_ext, NX_ext);
-	char muyzname[] = "muyz.dat";
-	wfile3d(muyzname, muyz, NZ_ext, NY_ext, NX_ext);
-	char C1xname[] = "C1x.dat";
-	wfile3d(C1xname, C1x, NZ_ext, NY_ext, NX_ext);
-	char C1yname[] = "C1y.dat";
-	wfile3d(C1yname, C1y, NZ_ext, NY_ext, NX_ext);
-	char C1zname[] = "C1z.dat";
-	wfile3d(C1zname, C1z, NZ_ext, NY_ext, NX_ext);
-	char C2xname[] = "C2x.dat";
-	wfile3d(C2xname, C2x, NZ_ext, NY_ext, NX_ext);
-	char C2yname[] = "C2y.dat";
-	wfile3d(C2yname, C2y, NZ_ext, NY_ext, NX_ext);
-	char C2zname[] = "C2z.dat";
-	wfile3d(C2zname, C2z, NZ_ext, NY_ext, NX_ext);
-	char cname[] = "C.dat";
-	wfile3d(cname, C_ext, NZ_ext, NY_ext, NX_ext);
-	char Mname[] = "M.dat";
-	wfile3d(Mname, M_ext, NZ_ext, NY_ext, NX_ext);
-	char C1name[] = "C1.dat";
-	wfile3d(C1name, C1_ext, NZ_ext, NY_ext, NX_ext);
-	char C2name[] = "C2.dat";
-	wfile3d(C2name, C2_ext, NZ_ext, NY_ext, NX_ext);
-	char HHname[] = "HH.dat";
-	wfile3d(HHname, HH_ext, NZ_ext, NY_ext, NX_ext);
-	char H2Uname[] = "H2U.dat";
-	wfile3d(H2Uname, H2u_ext, NZ_ext, NY_ext, NX_ext);
+	// char rho_tempxname[] = "rho_tempx.dat";
+	// wfile3d(rho_tempxname, rho_tempx, NZ_ext, NY_ext, NX_ext);
+	// char rho_tempyname[] = "rho_tempy.dat";
+	// wfile3d(rho_tempyname, rho_tempy, NZ_ext, NY_ext, NX_ext);
+	// char rho_tempzname[] = "rho_tempz.dat";
+	// wfile3d(rho_tempzname, rho_tempz, NZ_ext, NY_ext, NX_ext);
+	// char muxzname[] = "muxz.dat";
+	// wfile3d(muxzname, muxz, NZ_ext, NY_ext, NX_ext);
+	// char muxyname[] = "muxy.dat";
+	// wfile3d(muxyname, muxy, NZ_ext, NY_ext, NX_ext);
+	// char muyzname[] = "muyz.dat";
+	// wfile3d(muyzname, muyz, NZ_ext, NY_ext, NX_ext);
+	// char C1xname[] = "C1x.dat";
+	// wfile3d(C1xname, C1x, NZ_ext, NY_ext, NX_ext);
+	// char C1yname[] = "C1y.dat";
+	// wfile3d(C1yname, C1y, NZ_ext, NY_ext, NX_ext);
+	// char C1zname[] = "C1z.dat";
+	// wfile3d(C1zname, C1z, NZ_ext, NY_ext, NX_ext);
+	// char C2xname[] = "C2x.dat";
+	// wfile3d(C2xname, C2x, NZ_ext, NY_ext, NX_ext);
+	// char C2yname[] = "C2y.dat";
+	// wfile3d(C2yname, C2y, NZ_ext, NY_ext, NX_ext);
+	// char C2zname[] = "C2z.dat";
+	// wfile3d(C2zname, C2z, NZ_ext, NY_ext, NX_ext);
+	// char cname[] = "C.dat";
+	// wfile3d(cname, C_ext, NZ_ext, NY_ext, NX_ext);
+	// char Mname[] = "M.dat";
+	// wfile3d(Mname, M_ext, NZ_ext, NY_ext, NX_ext);
+	// char C1name[] = "C1.dat";
+	// wfile3d(C1name, C1_ext, NZ_ext, NY_ext, NX_ext);
+	// char C2name[] = "C2.dat";
+	// wfile3d(C2name, C2_ext, NZ_ext, NY_ext, NX_ext);
+	// char HHname[] = "HH.dat";
+	// wfile3d(HHname, HH_ext, NZ_ext, NY_ext, NX_ext);
+	// char H2Uname[] = "H2U.dat";
+	// wfile3d(H2Uname, H2u_ext, NZ_ext, NY_ext, NX_ext);
 	//---------------------------------------------------------------------
 	//pml吸收边界设置，开辟内存，赋值
 	float*** dxi, *** dxi2;
@@ -642,18 +642,18 @@ int main()
 			}
 		}
 	}
-	char dxiname[] = "dxi.dat";
-	wfile3d(dxiname, dxi, NZ_ext, NY_ext, NX_ext);
-	char dxi2name[] = "dxi2.dat";
-	wfile3d(dxi2name, dxi2, NZ_ext, NY_ext, NX_ext);
-	char dyjname[] = "dyj.dat";
-	wfile3d(dyjname, dyj, NZ_ext, NY_ext, NX_ext);
-	char dyj2name[] = "dyj2.dat";
-	wfile3d(dyj2name, dyj2, NZ_ext, NY_ext, NX_ext);
-	char dzkname[] = "dzk.dat";
-	wfile3d(dzkname, dzk, NZ_ext, NY_ext, NX_ext);
-	char dzk2name[] = "dzk2.dat";
-	wfile3d(dzk2name, dzk2, NZ_ext, NY_ext, NX_ext);
+	// char dxiname[] = "dxi.dat";
+	// wfile3d(dxiname, dxi, NZ_ext, NY_ext, NX_ext);
+	// char dxi2name[] = "dxi2.dat";
+	// wfile3d(dxi2name, dxi2, NZ_ext, NY_ext, NX_ext);
+	// char dyjname[] = "dyj.dat";
+	// wfile3d(dyjname, dyj, NZ_ext, NY_ext, NX_ext);
+	// char dyj2name[] = "dyj2.dat";
+	// wfile3d(dyj2name, dyj2, NZ_ext, NY_ext, NX_ext);
+	// char dzkname[] = "dzk.dat";
+	// wfile3d(dzkname, dzk, NZ_ext, NY_ext, NX_ext);
+	// char dzk2name[] = "dzk2.dat";
+	// wfile3d(dzk2name, dzk2, NZ_ext, NY_ext, NX_ext);
 	//-----------------------------------------------并行计算-------------------------------------------------------------------------
 	//-------------------------------------------------------------------------------------------------
 	//在主机端CPU定义参数，分配内存
@@ -1578,29 +1578,29 @@ void create_model(float*** vp, float*** vs, float*** rhos, float*** vf, float***
 		{
 			for (ix = 0; ix < nc; ix++)
 			{
-				// if (((ix - nc / 2) * (ix - nc / 2) + (iy - ny / 2) * (iy - ny / 2)) <= 100)
-				// 	//竖直井孔%%%%%%\// if(iz<(nr-14-ix)||iz>=(nr+14-ix))//45度倾斜井孔//if (iz>= 50)//if(ix>=50)
-				// {
-				// 	vp[iz][iy][ix] = 1500.0f;
-				// 	vs[iz][iy][ix] = 0.0f;
-				// 	vf[iz][iy][ix] = 1500.0f;
-				// 	rhos[iz][iy][ix] = 1000.0f;
-				// 	rhof[iz][iy][ix] = 1000.0f;
-				// 	rho[iz][iy][ix] = 1000.0f;
-				// 	por = 1.0;
-				// 	mu[iz][iy][ix] = 0.0f;
-				// 	Kb1 = 0.0;//骨架压缩模量，声波测井原理与应用，P39
-				// 	Ks1 = rhof[iz][iy][ix] * vp[iz][iy][ix] * vp[iz][iy][ix];//岩石固态颗粒的体积模量
-				// 	Kf1 = rhof[iz][iy][ix] * vf[iz][iy][ix] * vf[iz][iy][ix];//孔隙流体的体积压缩模量
-				// 	C[iz][iy][ix] = Kf1;
-				// 	M[iz][iy][ix] = Kf1;
-				// 	HH[iz][iy][ix] = Kf1;
-				// 	H2u[iz][iy][ix] = Kf1;
-				// 	C1[iz][iy][ix] = 0.0f;
-				// 	C2[iz][iy][ix] = rhof[iz][iy][ix];
-				// }
-				// else
-				// {
+				if (((ix - nc / 2) * (ix - nc / 2) + (iy - ny / 2) * (iy - ny / 2)) <= 100)
+					//竖直井孔%%%%%%\// if(iz<(nr-14-ix)||iz>=(nr+14-ix))//45度倾斜井孔//if (iz>= 50)//if(ix>=50)
+				{
+					vp[iz][iy][ix] = 1500.0f;
+					vs[iz][iy][ix] = 0.0f;
+					vf[iz][iy][ix] = 1500.0f;
+					rhos[iz][iy][ix] = 1000.0f;
+					rhof[iz][iy][ix] = 1000.0f;
+					rho[iz][iy][ix] = 1000.0f;
+					por = 1.0;
+					mu[iz][iy][ix] = 0.0f;
+					Kb1 = 0.0;//骨架压缩模量，声波测井原理与应用，P39
+					Ks1 = rhof[iz][iy][ix] * vp[iz][iy][ix] * vp[iz][iy][ix];//岩石固态颗粒的体积模量
+					Kf1 = rhof[iz][iy][ix] * vf[iz][iy][ix] * vf[iz][iy][ix];//孔隙流体的体积压缩模量
+					C[iz][iy][ix] = Kf1;
+					M[iz][iy][ix] = Kf1;
+					HH[iz][iy][ix] = Kf1;
+					H2u[iz][iy][ix] = Kf1;
+					C1[iz][iy][ix] = 0.0f;
+					C2[iz][iy][ix] = rhof[iz][iy][ix];
+				}
+				else
+				{
 					vp[iz][iy][ix] = 4000.0f;
 					vs[iz][iy][ix] = 2700.0f;
 					rhos[iz][iy][ix] = 2650.0f;
@@ -1623,7 +1623,7 @@ void create_model(float*** vp, float*** vs, float*** rhos, float*** vf, float***
 
 					C1[iz][iy][ix] = eta / perm;
 					C2[iz][iy][ix] = (1 + 2 / porousm) * tao * rhof[iz][iy][ix] / por;
-				// }
+				}
 			}
 		}
 	}

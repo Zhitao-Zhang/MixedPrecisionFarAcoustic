@@ -7,8 +7,6 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
-#include <conio.h>
-//#include <cutil.h>
 #define PI 3.1415926535
 #define e 2.718281828
 #define NZ 320	
@@ -1703,7 +1701,6 @@ int main()
 	free_space2d(sis_vu, NZ_ext);
 	free_space2d(sis_vw, NZ_ext);
 	printf("\Press any key to exit program...");
-	getch();
 	return 0;
 }
 
