@@ -9,7 +9,7 @@
 #include <time.h>
 #define PI 3.1415926535
 #define e 2.718281828
-#define NZ 320	
+#define NZ 128	
 #define NY 128   //此处是y轴的网格点数量
 #define NX 128
 #define NP 32
@@ -43,9 +43,9 @@ __global__ void Source(half* txx, half* tyy, half* tzz, float I_sou, int sn, int
 	int offset = ix + iy * NX_ext + iz * NX_ext * NY_ext;
 	if (offset == sn)
 	{
-		txx[offset] = (float)txx[offset] + I_sou;
-		tyy[offset] = (float)tyy[offset] + I_sou;
-		tzz[offset] = (float)tzz[offset] + I_sou;
+		txx[offset] = __float2half(__half2float(txx[offset]) + I_sou);
+		tyy[offset] = __float2half(__half2float(tyy[offset]) + I_sou);
+		tzz[offset] = __float2half(__half2float(tzz[offset]) + I_sou);
 	}
 }
 
@@ -74,7 +74,7 @@ __global__ void FD_V(half* vux, half* vuy, half* vuz,
 	float Cvwp3 = 1.0f;
 	float Cvup1 = 1.0f;
 	float Cvup2 = 1.0f;
-	float Cpmll = 100.0f;  // PML参数缩放因子，与main中的Cpml=0.01配合
+	float Cpmll = 100.0f;  // PML阻尼d参数缩放因子，与main中的Cpml=0.01配合
 
 	int ix = threadIdx.x + blockIdx.x * blockDim.x;
 	int iy = threadIdx.y + blockIdx.y * blockDim.y;
@@ -90,6 +90,8 @@ __global__ void FD_V(half* vux, half* vuy, half* vuz,
 	int offset_l = ix - 1 + iy * NX_ext + iz * NX_ext * NY_ext;
 	int offset_u = ix + iy * NX_ext + (1 + iz) * NX_ext * NY_ext;
 
+	if (ix > 0 && iy > 0 && iz > 0 && ix < (NX_ext - 1) && iy < (NY_ext - 1) && iz < (NZ_ext - 1))
+	{
 	//使用__half2float进行高精度转换
 	x1 = (__half2float(txx[offset_r]) - __half2float(txx[offset])) * H;
 	x2 = (__half2float(txy[offset]) - __half2float(txy[offset_h])) * H;
@@ -115,12 +117,13 @@ __global__ void FD_V(half* vux, half* vuy, half* vuz,
 	local_dyj2 = __half2float(dyj2[offset]) * Cpmll;
 	local_dzk = __half2float(dzk[offset]) * Cpmll;
 	local_dzk2 = __half2float(dzk2[offset]) * Cpmll;
-	local_e_dxi = __half2float(e_dxi[offset]) * Cpmll;
-	local_e_dxi2 = __half2float(e_dxi2[offset]) * Cpmll;
-	local_e_dyj = __half2float(e_dyj[offset]) * Cpmll;
-	local_e_dyj2 = __half2float(e_dyj2[offset]) * Cpmll;
-	local_e_dzk = __half2float(e_dzk[offset]) * Cpmll;
-	local_e_dzk2 = __half2float(e_dzk2[offset]) * Cpmll;
+	// e_* = exp(-d*dt) 是无量纲衰减因子，物理区应为1，不能像d_*一样缩放/反缩放。
+	local_e_dxi = __half2float(e_dxi[offset]);
+	local_e_dxi2 = __half2float(e_dxi2[offset]);
+	local_e_dyj = __half2float(e_dyj[offset]);
+	local_e_dyj2 = __half2float(e_dyj2[offset]);
+	local_e_dzk = __half2float(e_dzk[offset]);
+	local_e_dzk2 = __half2float(e_dzk2[offset]);
 
 	//PML计算 - 使用显式转换确保精度
 	pmlxSxx[offset] = __float2half(__half2float(pmlxSxx[offset]) * local_e_dxi2 + (-DT * local_dxi2 * 0.5f) * (local_e_dxi2 * __half2float(SXxx[offset]) + x1));
@@ -156,12 +159,13 @@ __global__ void FD_V(half* vux, half* vuy, half* vuz,
 	//速度更新 - 使用显式转换
 	vwx[offset] = __float2half(Cvwp1 * __half2float(VelocityWParameter1x[offset]) * __half2float(vwx[offset]) - Cvwp2 * __half2float(VelocityWParameter2x[offset]) * (x1 + x2 + x3) - Cvwp3 * __half2float(VelocityWParameter3x[offset]) * s1);
 	vwy[offset] = __float2half(Cvwp1 * __half2float(VelocityWParameter1y[offset]) * __half2float(vwy[offset]) - Cvwp2 * __half2float(VelocityWParameter2y[offset]) * (y1 + y2 + y3) - Cvwp3 * __half2float(VelocityWParameter3y[offset]) * s2);
-	vwz[offset] = __float2half(Cvwp1 * __half2float(VelocityWParameter1z[offset]) * __half2float(vwz[offset]) - Cvwp2 * __half2float(VelocityWParameter2z[offset]) * (z1 + z2 + z3) - Cvwp3 * __half2float(VelocityWParameter3y[offset]) * s3);
+	vwz[offset] = __float2half(Cvwp1 * __half2float(VelocityWParameter1z[offset]) * __half2float(vwz[offset]) - Cvwp2 * __half2float(VelocityWParameter2z[offset]) * (z1 + z2 + z3) - Cvwp3 * __half2float(VelocityWParameter3z[offset]) * s3);
 
 	vux[offset] = __float2half(__half2float(vux[offset]) + Cvup1 * __half2float(VelocityUParameter1x[offset]) * (x1 + x2 + x3) - Cvup2 * __half2float(VelocityUParameter2x[offset]) * (__half2float(vwx[offset]) - __half2float(vwx2[offset])));
 	vuy[offset] = __float2half(__half2float(vuy[offset]) + Cvup1 * __half2float(VelocityUParameter1y[offset]) * (y1 + y2 + y3) - Cvup2 * __half2float(VelocityUParameter2y[offset]) * (__half2float(vwy[offset]) - __half2float(vwy2[offset])));
 	vuz[offset] = __float2half(__half2float(vuz[offset]) + Cvup1 * __half2float(VelocityUParameter1z[offset]) * (z1 + z2 + z3) - Cvup2 * __half2float(VelocityUParameter2z[offset]) * (__half2float(vwz[offset]) - __half2float(vwz2[offset])));
 	vwx2[offset] = vwx[offset]; vwy2[offset] = vwy[offset]; vwz2[offset] = vwz[offset];
+	}
 }
 
 
@@ -189,7 +193,7 @@ __global__ void FD_T(half* vux, half* vuy, half* vuz, half* txx, half* tzz, half
 	float Csp2 = 0.01f;   // 对应Csp2=100
 	float Csp3 = 0.01f;   // 对应Csp3=100
 	float Csp4 = 0.01f;   // 对应Csp4=100
-	float Cpmll = 100.0f; // 对应Cpml=0.01
+	float Cpmll = 100.0f; // 仅用于PML阻尼d参数，对应main中的Cpml=0.01
 
 	int ix = threadIdx.x + blockIdx.x * blockDim.x;
 	int iy = threadIdx.y + blockIdx.y * blockDim.y;
@@ -202,6 +206,8 @@ __global__ void FD_T(half* vux, half* vuy, half* vuz, half* txx, half* tzz, half
 	int offset_l = ix - 1 + iy * NX_ext + iz * NX_ext * NY_ext;
 	int offset_u = ix + iy * NX_ext + (1 + iz) * NX_ext * NY_ext;
 
+	if (ix > 0 && iy > 0 && iz > 0 && ix < (NX_ext - 1) && iy < (NY_ext - 1) && iz < (NZ_ext - 1))
+	{
 	//使用__half2float进行高精度转换
 	uxx = (__half2float(vux[offset]) - __half2float(vux[offset_l])) * H;
 	uyy = (__half2float(vuy[offset]) - __half2float(vuy[offset_h])) * H;
@@ -229,12 +235,13 @@ __global__ void FD_T(half* vux, half* vuy, half* vuz, half* txx, half* tzz, half
 	local_dyj2 = __half2float(dyj2[offset]) * Cpmll;
 	local_dzk = __half2float(dzk[offset]) * Cpmll;
 	local_dzk2 = __half2float(dzk2[offset]) * Cpmll;
-	local_e_dxi = __half2float(e_dxi[offset]) * Cpmll;
-	local_e_dxi2 = __half2float(e_dxi2[offset]) * Cpmll;
-	local_e_dyj = __half2float(e_dyj[offset]) * Cpmll;
-	local_e_dyj2 = __half2float(e_dyj2[offset]) * Cpmll;
-	local_e_dzk = __half2float(e_dzk[offset]) * Cpmll;
-	local_e_dzk2 = __half2float(e_dzk2[offset]) * Cpmll;
+	// e_* = exp(-d*dt) 是无量纲衰减因子，物理区应为1，不能像d_*一样缩放/反缩放。
+	local_e_dxi = __half2float(e_dxi[offset]);
+	local_e_dxi2 = __half2float(e_dxi2[offset]);
+	local_e_dyj = __half2float(e_dyj[offset]);
+	local_e_dyj2 = __half2float(e_dyj2[offset]);
+	local_e_dzk = __half2float(e_dzk[offset]);
+	local_e_dzk2 = __half2float(e_dzk2[offset]);
 
 	//PML计算 - 使用显式转换确保精度
 	pmlxVux[offset] = __float2half(__half2float(pmlxVux[offset]) * local_e_dxi + (-DT * local_dxi * 0.5f) * (local_e_dxi * __half2float(Vuxx[offset]) + uxx));
@@ -279,6 +286,7 @@ __global__ void FD_T(half* vux, half* vuy, half* vuz, half* txx, half* tzz, half
 	txy[offset] = __float2half(__half2float(txy[offset]) + Csp4 * __half2float(StressParameterxy[offset]) * (uxy + uyx));
 	tyz[offset] = __float2half(__half2float(tyz[offset]) + Csp4 * __half2float(StressParameteryz[offset]) * (uyz + uzy));
 	txz[offset] = __float2half(__half2float(txz[offset]) + Csp4 * __half2float(StressParameterxz[offset]) * (uxz + uzx));
+	}
 
 }
 
@@ -300,7 +308,7 @@ int main()
 	int NT = 3500;	        //时间层数
 	//int NT1 = NT * m * m; // 连续变换2次
 	float H = 0.01;//空间步长
-	float RC = 0.9 * pow(10.0, -6);
+	float RC = 1.0 * pow(10.0, -6);
 	float DT = 0.9 * pow(10.0, -6);	    //时间步长
 	float DP = NP * H;
 	float DT_H = DT / H;
@@ -513,7 +521,7 @@ int main()
 	float Csp3 = 100.0;
 	float Csp4 = 100.0;
 	float zero = 0.0;
-	float Cpml = 0.01;    // PML参数缩放，保持0.01
+	float Cpml = 0.01;    // 仅缩放PML阻尼d参数；e=exp(-d*dt)不缩放，保持物理区为1
 
 	int ix, iy, iz, it;
 	for (iz = 1; iz < NZ_ext - 1; iz++)
@@ -542,9 +550,10 @@ int main()
 				rhof_exty[iz][iy][ix] = 0.5 * (rhof_ext[iz][iy][ix] + rhof_ext[iz][iy + 1][ix]);
 				rhof_extz[iz][iy][ix] = 0.5 * (rhof_ext[iz][iy][ix] + rhof_ext[iz + 1][iy][ix]);
 
-				rho_tempx[iz][iy][ix] = 0.5 * (rho_ext[iz][iy][ix] + rho_ext[iz][iy][ix + 1]);
-				rho_tempy[iz][iy][ix] = 0.5 * (rho_ext[iz][iy][ix] + rho_ext[iz][iy + 1][ix]);
-				rho_tempz[iz][iy][ix] = 0.5 * (rho_ext[iz][iy][ix] + rho_ext[iz + 1][iy][ix]);
+				// 交错网格速度点使用密度倒数的界面平均，保持与Float版本一致。
+				rho_tempx[iz][iy][ix] = 2.0f / (rho_ext[iz][iy][ix] + rho_ext[iz][iy][ix + 1]);
+				rho_tempy[iz][iy][ix] = 2.0f / (rho_ext[iz][iy][ix] + rho_ext[iz][iy + 1][ix]);
+				rho_tempz[iz][iy][ix] = 2.0f / (rho_ext[iz][iy][ix] + rho_ext[iz + 1][iy][ix]);
 
 				C1x[iz][iy][ix] = 0.5 * (C1_ext[iz][iy][ix] + C1_ext[iz][iy][ix + 1]);
 				C1y[iz][iy][ix] = 0.5 * (C1_ext[iz][iy][ix] + C1_ext[iz][iy + 1][ix]);
@@ -972,12 +981,12 @@ int main()
 				h_dxi2[i + j * NX_ext + k * NX_ext * NY_ext] = dxi2[k][j][i] * Cpml;
 				h_dyj2[i + j * NX_ext + k * NX_ext * NY_ext] = dyj2[k][j][i] * Cpml;
 				h_dzk2[i + j * NX_ext + k * NX_ext * NY_ext] = dzk2[k][j][i] * Cpml;
-				h_e_dxi[i + j * NX_ext + k * NX_ext * NY_ext] = e_dxi[k][j][i] * Cpml;
-				h_e_dyj[i + j * NX_ext + k * NX_ext * NY_ext] = e_dyj[k][j][i] * Cpml;
-				h_e_dzk[i + j * NX_ext + k * NX_ext * NY_ext] = e_dzk[k][j][i] * Cpml;
-				h_e_dxi2[i + j * NX_ext + k * NX_ext * NY_ext] = e_dxi2[k][j][i] * Cpml;
-				h_e_dyj2[i + j * NX_ext + k * NX_ext * NY_ext] = e_dyj2[k][j][i] * Cpml;
-				h_e_dzk2[i + j * NX_ext + k * NX_ext * NY_ext] = e_dzk2[k][j][i] * Cpml;
+				h_e_dxi[i + j * NX_ext + k * NX_ext * NY_ext] = e_dxi[k][j][i];
+				h_e_dyj[i + j * NX_ext + k * NX_ext * NY_ext] = e_dyj[k][j][i];
+				h_e_dzk[i + j * NX_ext + k * NX_ext * NY_ext] = e_dzk[k][j][i];
+				h_e_dxi2[i + j * NX_ext + k * NX_ext * NY_ext] = e_dxi2[k][j][i];
+				h_e_dyj2[i + j * NX_ext + k * NX_ext * NY_ext] = e_dyj2[k][j][i];
+				h_e_dzk2[i + j * NX_ext + k * NX_ext * NY_ext] = e_dzk2[k][j][i];
 			}
 		}
 	}
@@ -1253,7 +1262,7 @@ int main()
 		{
 			printf("it=%d\n", it);
 		}
-		if (it % MM == 0 && it < 1500)
+		if (it % MM == 0)
 		{
 			//加震源
 			float I_sou;
@@ -1285,7 +1294,7 @@ int main()
 
 		for (iz = 0; iz < NZ_ext; iz++)
 		{
-			sis_x[iz][it] = h_txx[iz * NX_ext * NY_ext + sx + sy * NX_ext];
+			sis_x[iz][it] = __half2float(h_txx[iz * NX_ext * NY_ext + sx + sy * NX_ext]);
 			//sis_z[iz][it] = h_tzz[iz * NX_ext * NY_ext + sx + sy * NX_ext];
 
 			//sis_vu[iz][it] = h_vux[iz * NX_ext * NY_ext + sx + sy * NX_ext];
@@ -1299,7 +1308,7 @@ int main()
 				{
 					for (int i = 0; i < NX_ext; i++)
 					{
-						txx50[k][j][i] = h_txx[i + j * NX_ext + k * NX_ext * NY_ext];
+						txx50[k][j][i] = __half2float(h_txx[i + j * NX_ext + k * NX_ext * NY_ext]);
 						//vux50[k][j][i] = h_vux[i + j * NX_ext + k * NX_ext * NY_ext];
 						//vwx50[k][j][i] = h_vwx[i + j * NX_ext + k * NX_ext * NY_ext];
 						//vuz50[k][j][i] = h_vuz[i + j * NX_ext + k * NX_ext * NY_ext];
@@ -1314,7 +1323,7 @@ int main()
 				{
 					for (int i = 0; i < NX_ext; i++)
 					{
-						txx100[k][j][i] = h_txx[i + j * NX_ext + k * NX_ext * NY_ext];
+						txx100[k][j][i] = __half2float(h_txx[i + j * NX_ext + k * NX_ext * NY_ext]);
 					}
 				}
 			}
@@ -1325,7 +1334,7 @@ int main()
 				{
 					for (int i = 0; i < NX_ext; i++)
 					{
-						txx150[k][j][i] = h_txx[i + j * NX_ext + k * NX_ext * NY_ext];
+						txx150[k][j][i] = __half2float(h_txx[i + j * NX_ext + k * NX_ext * NY_ext]);
 					}
 				}
 			}
@@ -1336,7 +1345,7 @@ int main()
 				{
 					for (int i = 0; i < NX_ext; i++)
 					{
-						txx200[k][j][i] = h_txx[i + j * NX_ext + k * NX_ext * NY_ext];
+						txx200[k][j][i] = __half2float(h_txx[i + j * NX_ext + k * NX_ext * NY_ext]);
 					}
 				}
 			}
@@ -1347,7 +1356,7 @@ int main()
 				{
 					for (int i = 0; i < NX_ext; i++)
 					{
-						txx250[k][j][i] = h_txx[i + j * NX_ext + k * NX_ext * NY_ext];
+						txx250[k][j][i] = __half2float(h_txx[i + j * NX_ext + k * NX_ext * NY_ext]);
 					}
 				}
 			}
@@ -1358,7 +1367,7 @@ int main()
 				{
 					for (int i = 0; i < NX_ext; i++)
 					{
-						txx300[k][j][i] = h_txx[i + j * NX_ext + k * NX_ext * NY_ext];
+						txx300[k][j][i] = __half2float(h_txx[i + j * NX_ext + k * NX_ext * NY_ext]);
 					}
 				}
 			}
@@ -1370,7 +1379,7 @@ int main()
 		{
 			for (int i = 0; i < NX_ext; i++)
 			{
-				txx[k][j][i] = h_txx[i + j * NX_ext + k * NX_ext * NY_ext];
+				txx[k][j][i] = __half2float(h_txx[i + j * NX_ext + k * NX_ext * NY_ext]);
 			}
 		}
 	}
