@@ -10,6 +10,13 @@
 #include <time.h>
 #define PI 3.1415926535
 #define e 2.718281828
+#define CUDA_CHECK(call) do { \
+	cudaError_t err = (call); \
+	if (err != cudaSuccess) { \
+		fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
+		exit(1); \
+	} \
+} while (0)
 #define NZ 128	
 #define NY 128   //此处是y轴的网格点数量
 #define NX 128
@@ -222,6 +229,8 @@ __global__ void FD_T(float* vux, float* vuy, float* vuz, float* txx, float* tzz,
 	int offset_l = ix - 1 + iy * NX_ext + iz * NX_ext * NY_ext;//左
 	int offset_u = ix + iy * NX_ext + (1 + iz) * NX_ext * NY_ext;//下
 
+	if (ix > 0 && iy > 0 && iz > 0 && ix < (NX_ext - 1) && iy < (NY_ext - 1) && iz < (NZ_ext - 1))
+	{
 	uxx = (vux[offset] - vux[offset_l]) / H;
 	uyy = (vuy[offset] - vuy[offset_h]) / H;
 	uzz = (vuz[offset] - vuz[offset_b]) / H;
@@ -282,6 +291,7 @@ __global__ void FD_T(float* vux, float* vuy, float* vuz, float* txx, float* tzz,
 	txy[offset] = txy[offset] + muxy[offset] * DT * (uxy + uyx);
 	tyz[offset] = tyz[offset] + muyz[offset] * DT * (uyz + uzy);
 	txz[offset] = txz[offset] + muxz[offset] * DT * (uxz + uzx);
+	}
 }
 
 
@@ -801,6 +811,10 @@ int main()
 
 	//------------------------------------------------------------------------------------------------------------
 	//在设备端GPU定义参数，分配内存
+	CUDA_CHECK(cudaSetDevice(0));
+	cudaDeviceProp gpu_prop;
+	CUDA_CHECK(cudaGetDeviceProperties(&gpu_prop, 0));
+	printf("Using GPU: %s (SM %d.%d)\n", gpu_prop.name, gpu_prop.major, gpu_prop.minor);
 	float* d_rho_tempx, * d_rho_tempy, * d_rho_tempz, * d_muxz, * d_muxy, * d_muyz, * d_rhof_ext, * d_HH_ext, * d_H2u_ext, * d_C_ext, * d_M_ext;	   //初始模型密度
 	float* d_vux, * d_vuy, * d_vuz;
 	float* d_vwx, * d_vwy, * d_vwz;
@@ -1026,6 +1040,10 @@ int main()
 	cudaMemcpy(d_C2z, h_C2z, mem_size, cudaMemcpyHostToDevice);
 	//---------------------------------------------------------------------------------------------------------------------
 	//在时间上进行迭代
+	cudaEvent_t loop_start, loop_stop;
+	CUDA_CHECK(cudaEventCreate(&loop_start));
+	CUDA_CHECK(cudaEventCreate(&loop_stop));
+	CUDA_CHECK(cudaEventRecord(loop_start));
 	//for (it = 0; it < NT1; it++)
 	for (it = 0; it < NT; it++)
 	{
@@ -1156,7 +1174,14 @@ int main()
 		}
 	}
 	finish = clock();
-	printf("%f seconds\n", (float)(finish - start) / CLOCKS_PER_SEC);
+	CUDA_CHECK(cudaEventRecord(loop_stop));
+	CUDA_CHECK(cudaEventSynchronize(loop_stop));
+	float gpu_loop_ms = 0.0f;
+	CUDA_CHECK(cudaEventElapsedTime(&gpu_loop_ms, loop_start, loop_stop));
+	CUDA_CHECK(cudaEventDestroy(loop_start));
+	CUDA_CHECK(cudaEventDestroy(loop_stop));
+	printf("CPU wall-ish time (clock): %f seconds\n", (float)(finish - start) / CLOCKS_PER_SEC);
+	printf("GPU time loop (cudaEvent): %f seconds\n", gpu_loop_ms / 1000.0f);
 	//--------------------------------------------------------------------------------------------------------------
 	//输出波场快照
 	char txxname[] = "txx.dat";
