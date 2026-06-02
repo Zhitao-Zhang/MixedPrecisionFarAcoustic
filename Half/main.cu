@@ -27,6 +27,12 @@
 #ifndef WAVEFIELD_ES_INT
 #define WAVEFIELD_ES_INT 0
 #endif
+#ifndef DYNAMIC_SCALE_END
+#define DYNAMIC_SCALE_END 16.0f
+#endif
+#ifndef DYNAMIC_SCALE_INTERVAL
+#define DYNAMIC_SCALE_INTERVAL 100
+#endif
 
 float** space2d(int nr, int nc);
 float*** space3d(int nr, int ny, int nc);
@@ -50,21 +56,83 @@ __device__ __forceinline__ void store_h(half* data, int offset, float value)
 	data[offset] = __float2half(value);
 }
 
-__device__ __forceinline__ float load_ch(const half* hi, const half* lo, int offset)
+__host__ __device__ __forceinline__ float residual_unit_from_half_float(float hi_float)
 {
-	return __half2float(hi[offset]) + __half2float(lo[offset]);
+	float a = fabsf(hi_float);
+	if (a < 6.103515625e-5f)
+		return 2.3283064365386963e-10f; // 2^-24 / 256
+	int exp = 0;
+	frexpf(a, &exp);
+	return ldexpf(1.0f, exp - 19); // half ULP / 256
 }
 
-__device__ __forceinline__ void store_ch(half* hi, half* lo, int offset, float value)
+__host__ __device__ __forceinline__ float load_cr_value(half hi, signed char residual)
+{
+	float hi_float = __half2float(hi);
+	return hi_float + (float)residual * residual_unit_from_half_float(hi_float);
+}
+
+__device__ __forceinline__ float load_ch(const half* hi, const signed char* lo, int offset)
+{
+	return load_cr_value(hi[offset], lo[offset]);
+}
+
+__host__ __forceinline__ float load_cr_host(const half* hi, const signed char* lo, int offset)
+{
+	return load_cr_value(hi[offset], lo[offset]);
+}
+
+__device__ __forceinline__ signed char quantize_residual(float residual, float unit)
+{
+	float scaled = residual / unit;
+	int q = (int)(scaled + (scaled >= 0.0f ? 0.5f : -0.5f));
+	if (q > 127) q = 127;
+	if (q < -127) q = -127;
+	return (signed char)q;
+}
+
+__device__ __forceinline__ void store_ch(half* hi, signed char* lo, int offset, float value)
 {
 	half hi_val = __float2half(value);
 	float hi_float = __half2float(hi_val);
 	hi[offset] = hi_val;
-	lo[offset] = __float2half(value - hi_float);
+	lo[offset] = quantize_residual(value - hi_float, residual_unit_from_half_float(hi_float));
+}
+
+__global__ void ScaleHalfArray(half* data, float factor, int count)
+{
+	int idx = threadIdx.x + blockIdx.x * blockDim.x;
+	if (idx < count)
+		data[idx] = __float2half(__half2float(data[idx]) * factor);
+}
+
+__global__ void ScaleCompressedArray(half* hi, signed char* lo, float factor, int count)
+{
+	int idx = threadIdx.x + blockIdx.x * blockDim.x;
+	if (idx < count)
+		store_ch(hi, lo, idx, load_ch(hi, lo, idx) * factor);
+}
+
+float dynamic_scale_for_step(int it, int nt)
+{
+	if (nt <= 1)
+		return DYNAMIC_SCALE_END;
+	float alpha = (float)it / (float)(nt - 1);
+	return 1.0f + (DYNAMIC_SCALE_END - 1.0f) * alpha;
+}
+
+__device__ __forceinline__ float pml_dt_d(half scaled_dt_d, float inv_scale_pml)
+{
+	return inv_scale_pml * __half2float(scaled_dt_d);
+}
+
+__device__ __forceinline__ float pml_e(half scaled_one_minus_e, float inv_scale_pml)
+{
+	return 1.0f - inv_scale_pml * __half2float(scaled_one_minus_e);
 }
 //-------------------------------------------------------------------------------------------------------------------------------
 //计算震源
-__global__ void Source(half* txx, half* txx_lo, half* tyy, half* tyy_lo, half* tzz, half* tzz_lo, float I_sou, int sn, int NX_ext, int NY_ext, int NZ_ext)
+__global__ void Source(half* txx, signed char* txx_lo, half* tyy, signed char* tyy_lo, half* tzz, signed char* tzz_lo, float I_sou, int sn, int NX_ext, int NY_ext, int NZ_ext)
 {
 	//加震源
 	int ix = threadIdx.x + blockIdx.x * blockDim.x;
@@ -85,13 +153,13 @@ __global__ void Source(half* txx, half* txx_lo, half* tyy, half* tyy_lo, half* t
 
 
 
-__global__ void FD_V(half* vux, half* vux_lo, half* vuy, half* vuy_lo, half* vuz, half* vuz_lo, half* rho_inv_tildex, half* rho_inv_tildey, half* rho_inv_tildez,
-	half* txx, half* txx_lo, half* tyy, half* tyy_lo, half* tzz, half* tzz_lo, half* txz, half* txz_lo, half* txy, half* txy_lo, half* tyz, half* tyz_lo,
+__global__ void FD_V(half* vux, signed char* vux_lo, half* vuy, signed char* vuy_lo, half* vuz, signed char* vuz_lo, half* rho_inv_tildex, half* rho_inv_tildey, half* rho_inv_tildez,
+	half* txx, signed char* txx_lo, half* tyy, signed char* tyy_lo, half* tzz, signed char* tzz_lo, half* txz, signed char* txz_lo, half* txy, signed char* txy_lo, half* tyz, signed char* tyz_lo,
 	half* pmlxSxx, half* pmlySxy, half* pmlzSxz, half* pmlxSxy, half* pmlySyy, half* pmlzSyz, half* pmlxSxz, half* pmlySyz, half* pmlzSzz,
 	half* SXxx, half* SXxy, half* SXxz, half* SYxy, half* SYyy, half* SYyz, half* SZxz, half* SZyz, half* SZzz,
-	float* e_dxi, float* dxi, float* e_dxi2, float* dxi2, float* e_dyj, float* dyj, float* e_dyj2, float* dyj2, float* e_dzk, float* dzk, float* dzk2, float* e_dzk2,
-	half* ss, half* ss_lo, half* vwx, half* vwx_lo, half* vwy, half* vwy_lo, half* vwz, half* vwz_lo, half* vwx2, half* vwx2_lo, half* vwy2, half* vwy2_lo, half* vwz2, half* vwz2_lo, half* SXss, half* SYss, half* SZss, half* pmlxss, half* pmlyss, half* pmlzss,
-	half* Awx, half* Awy, half* Awz, half* Bpx, half* Bpy, half* Bpz, half* Btx, half* Bty, half* Btz, half* rhof_rho_invx, half* rhof_rho_invy, half* rhof_rho_invz, float DT)
+	half* e_dxi, half* dxi, half* e_dxi2, half* dxi2, half* e_dyj, half* dyj, half* e_dyj2, half* dyj2, half* e_dzk, half* dzk, half* dzk2, half* e_dzk2,
+	half* ss, signed char* ss_lo, half* vwx, signed char* vwx_lo, half* vwy, signed char* vwy_lo, half* vwz, signed char* vwz_lo, half* vwx2, signed char* vwx2_lo, half* vwy2, signed char* vwy2_lo, half* vwz2, signed char* vwz2_lo, half* SXss, half* SYss, half* SZss, half* pmlxss, half* pmlyss, half* pmlzss,
+	half* Awx, half* Awy, half* Awz, half* Bpx, half* Bpy, half* Bpz, half* Btx, half* Bty, half* Btz, half* rhof_rho_invx, half* rhof_rho_invy, half* rhof_rho_invz, float inv_scale_pml, float DT)
 {
 	float x1, x2, x3;
 	float z1, z2, z3;
@@ -130,10 +198,10 @@ __global__ void FD_V(half* vux, half* vux_lo, half* vuy, half* vuy_lo, half* vuz
 		z3 = (load_ch(tyz, tyz_lo, offset) - load_ch(tyz, tyz_lo, offset_h)) / H;
 		s3 = (load_ch(ss, ss_lo, offset_u) - load_ch(ss, ss_lo, offset)) / H;
 
-		float pmlxSxx_new = h2f(pmlxSxx[offset]) * e_dxi2[offset] + (-DT * dxi2[offset] * 0.5f) * (e_dxi2[offset] * h2f(SXxx[offset]) + x1);
-		float pmlySxy_new = h2f(pmlySxy[offset]) * e_dyj[offset] + (-DT * dyj[offset] * 0.5f) * (e_dyj[offset] * h2f(SXxy[offset]) + x2);
-		float pmlzSxz_new = h2f(pmlzSxz[offset]) * e_dzk[offset] + (-DT * dzk[offset] * 0.5f) * (e_dzk[offset] * h2f(SXxz[offset]) + x3);
-		float pmlxss_new = h2f(pmlxss[offset]) * e_dxi2[offset] + (-DT * dxi2[offset] * 0.5f) * (e_dxi2[offset] * h2f(SXss[offset]) + s1);
+		float pmlxSxx_new = h2f(pmlxSxx[offset]) * pml_e(e_dxi2[offset], inv_scale_pml) + (-pml_dt_d(dxi2[offset], inv_scale_pml) * 0.5f) * (pml_e(e_dxi2[offset], inv_scale_pml) * h2f(SXxx[offset]) + x1);
+		float pmlySxy_new = h2f(pmlySxy[offset]) * pml_e(e_dyj[offset], inv_scale_pml) + (-pml_dt_d(dyj[offset], inv_scale_pml) * 0.5f) * (pml_e(e_dyj[offset], inv_scale_pml) * h2f(SXxy[offset]) + x2);
+		float pmlzSxz_new = h2f(pmlzSxz[offset]) * pml_e(e_dzk[offset], inv_scale_pml) + (-pml_dt_d(dzk[offset], inv_scale_pml) * 0.5f) * (pml_e(e_dzk[offset], inv_scale_pml) * h2f(SXxz[offset]) + x3);
+		float pmlxss_new = h2f(pmlxss[offset]) * pml_e(e_dxi2[offset], inv_scale_pml) + (-pml_dt_d(dxi2[offset], inv_scale_pml) * 0.5f) * (pml_e(e_dxi2[offset], inv_scale_pml) * h2f(SXss[offset]) + s1);
 		store_h(pmlxSxx, offset, pmlxSxx_new);
 		store_h(pmlySxy, offset, pmlySxy_new);
 		store_h(pmlzSxz, offset, pmlzSxz_new);
@@ -144,10 +212,10 @@ __global__ void FD_V(half* vux, half* vux_lo, half* vuy, half* vuy_lo, half* vuz
 		x3 = x3 + pmlzSxz_new;
 		s1 = s1 + pmlxss_new;
 
-		float pmlxSxy_new = h2f(pmlxSxy[offset]) * e_dxi[offset] + (-DT * dxi[offset] * 0.5f) * (e_dxi[offset] * h2f(SYxy[offset]) + y2);
-		float pmlySyy_new = h2f(pmlySyy[offset]) * e_dyj2[offset] + (-DT * dyj2[offset] * 0.5f) * (e_dyj2[offset] * h2f(SYyy[offset]) + y1);
-		float pmlzSyz_new = h2f(pmlzSyz[offset]) * e_dzk[offset] + (-DT * dzk[offset] * 0.5f) * (e_dzk[offset] * h2f(SYyz[offset]) + y3);
-		float pmlyss_new = h2f(pmlyss[offset]) * e_dyj2[offset] + (-DT * dyj2[offset] * 0.5f) * (e_dyj2[offset] * h2f(SYss[offset]) + s2);
+		float pmlxSxy_new = h2f(pmlxSxy[offset]) * pml_e(e_dxi[offset], inv_scale_pml) + (-pml_dt_d(dxi[offset], inv_scale_pml) * 0.5f) * (pml_e(e_dxi[offset], inv_scale_pml) * h2f(SYxy[offset]) + y2);
+		float pmlySyy_new = h2f(pmlySyy[offset]) * pml_e(e_dyj2[offset], inv_scale_pml) + (-pml_dt_d(dyj2[offset], inv_scale_pml) * 0.5f) * (pml_e(e_dyj2[offset], inv_scale_pml) * h2f(SYyy[offset]) + y1);
+		float pmlzSyz_new = h2f(pmlzSyz[offset]) * pml_e(e_dzk[offset], inv_scale_pml) + (-pml_dt_d(dzk[offset], inv_scale_pml) * 0.5f) * (pml_e(e_dzk[offset], inv_scale_pml) * h2f(SYyz[offset]) + y3);
+		float pmlyss_new = h2f(pmlyss[offset]) * pml_e(e_dyj2[offset], inv_scale_pml) + (-pml_dt_d(dyj2[offset], inv_scale_pml) * 0.5f) * (pml_e(e_dyj2[offset], inv_scale_pml) * h2f(SYss[offset]) + s2);
 		store_h(pmlxSxy, offset, pmlxSxy_new);
 		store_h(pmlySyy, offset, pmlySyy_new);
 		store_h(pmlzSyz, offset, pmlzSyz_new);
@@ -158,10 +226,10 @@ __global__ void FD_V(half* vux, half* vux_lo, half* vuy, half* vuy_lo, half* vuz
 		y3 = y3 + pmlzSyz_new;
 		s2 = s2 + pmlyss_new;
 
-		float pmlxSxz_new = h2f(pmlxSxz[offset]) * e_dxi[offset] + (-DT * dxi[offset] * 0.5f) * (e_dxi[offset] * h2f(SZxz[offset]) + z2);
-		float pmlySyz_new = h2f(pmlySyz[offset]) * e_dyj[offset] + (-DT * dyj[offset] * 0.5f) * (e_dyj[offset] * h2f(SZyz[offset]) + z3);
-		float pmlzSzz_new = h2f(pmlzSzz[offset]) * e_dzk2[offset] + (-DT * dzk2[offset] * 0.5f) * (e_dzk2[offset] * h2f(SZzz[offset]) + z1);
-		float pmlzss_new = h2f(pmlzss[offset]) * e_dzk2[offset] + (-DT * dzk2[offset] * 0.5f) * (e_dzk2[offset] * h2f(SZss[offset]) + s3);
+		float pmlxSxz_new = h2f(pmlxSxz[offset]) * pml_e(e_dxi[offset], inv_scale_pml) + (-pml_dt_d(dxi[offset], inv_scale_pml) * 0.5f) * (pml_e(e_dxi[offset], inv_scale_pml) * h2f(SZxz[offset]) + z2);
+		float pmlySyz_new = h2f(pmlySyz[offset]) * pml_e(e_dyj[offset], inv_scale_pml) + (-pml_dt_d(dyj[offset], inv_scale_pml) * 0.5f) * (pml_e(e_dyj[offset], inv_scale_pml) * h2f(SZyz[offset]) + z3);
+		float pmlzSzz_new = h2f(pmlzSzz[offset]) * pml_e(e_dzk2[offset], inv_scale_pml) + (-pml_dt_d(dzk2[offset], inv_scale_pml) * 0.5f) * (pml_e(e_dzk2[offset], inv_scale_pml) * h2f(SZzz[offset]) + z1);
+		float pmlzss_new = h2f(pmlzss[offset]) * pml_e(e_dzk2[offset], inv_scale_pml) + (-pml_dt_d(dzk2[offset], inv_scale_pml) * 0.5f) * (pml_e(e_dzk2[offset], inv_scale_pml) * h2f(SZss[offset]) + s3);
 		store_h(pmlxSxz, offset, pmlxSxz_new);
 		store_h(pmlySyz, offset, pmlySyz_new);
 		store_h(pmlzSzz, offset, pmlzSzz_new);
@@ -199,12 +267,12 @@ __global__ void FD_V(half* vux, half* vux_lo, half* vuy, half* vuy_lo, half* vuz
 	}
 }
 
-__global__ void FD_T(half* vux, half* vux_lo, half* vuy, half* vuy_lo, half* vuz, half* vuz_lo, half* txx, half* txx_lo, half* tzz, half* tzz_lo, half* tyy, half* tyy_lo, half* txz, half* txz_lo, half* txy, half* txy_lo, half* tyz, half* tyz_lo,
+__global__ void FD_T(half* vux, signed char* vux_lo, half* vuy, signed char* vuy_lo, half* vuz, signed char* vuz_lo, half* txx, signed char* txx_lo, half* tzz, signed char* tzz_lo, half* tyy, signed char* tyy_lo, half* txz, signed char* txz_lo, half* txy, signed char* txy_lo, half* tyz, signed char* tyz_lo,
 	half* pmlxVux, half* muxy_tilde, half* muxz_tilde, half* muyz_tilde,
 	half* pmlyVuy, half* pmlzVuz, half* pmlxVuy, half* pmlyVux, half* pmlyVuz, half* pmlzVuy, half* pmlzVux, half* pmlxVuz,
 	half* Vuxx, half* Vuxy, half* Vuxz, half* Vuyx, half* Vuyy, half* Vuyz, half* Vuzx, half* Vuzy, half* Vuzz,
-	float* e_dxi, float* dxi, float* e_dxi2, float* dxi2, float* e_dyj2, float* dyj2, float* e_dyj, float* dyj, float* dzk2, float* e_dzk2, float* e_dzk, float* dzk,
-	half* Vwxx, half* Vwyy, half* Vwzz, half* vwx, half* vwx_lo, half* vwy, half* vwy_lo, half* vwz, half* vwz_lo, half* C_tilde, half* M_tilde, half* HH_tilde, half* H2u_tilde, half* ss, half* ss_lo, half* pmlxVwx, half* pmlyVwy, half* pmlzVwz, float DT)
+	half* e_dxi, half* dxi, half* e_dxi2, half* dxi2, half* e_dyj2, half* dyj2, half* e_dyj, half* dyj, half* dzk2, half* e_dzk2, half* e_dzk, half* dzk,
+	half* Vwxx, half* Vwyy, half* Vwzz, half* vwx, signed char* vwx_lo, half* vwy, signed char* vwy_lo, half* vwz, signed char* vwz_lo, half* C_tilde, half* M_tilde, half* HH_tilde, half* H2u_tilde, half* ss, signed char* ss_lo, half* pmlxVwx, half* pmlyVwy, half* pmlzVwz, float inv_scale_pml, float DT)
 {
 	float uxx, uyy, uzz;
 	float uxy, uxz, uyx, uyz, uzx, uzy;
@@ -244,9 +312,9 @@ __global__ void FD_T(half* vux, half* vux_lo, half* vuy, half* vuy_lo, half* vuz
 	uzy = (load_ch(vuz, vuz_lo, offset_q) - load_ch(vuz, vuz_lo, offset)) / H;
 
 
-	float pmlxVux_new = h2f(pmlxVux[offset]) * e_dxi[offset] + (-DT * dxi[offset] * 0.5f) * (e_dxi[offset] * h2f(Vuxx[offset]) + uxx);
-	float pmlyVuy_new = h2f(pmlyVuy[offset]) * e_dyj[offset] + (-DT * dyj[offset] * 0.5f) * (e_dyj[offset] * h2f(Vuyy[offset]) + uyy);
-	float pmlzVuz_new = h2f(pmlzVuz[offset]) * e_dzk[offset] + (-DT * dzk[offset] * 0.5f) * (e_dzk[offset] * h2f(Vuzz[offset]) + uzz);
+	float pmlxVux_new = h2f(pmlxVux[offset]) * pml_e(e_dxi[offset], inv_scale_pml) + (-pml_dt_d(dxi[offset], inv_scale_pml) * 0.5f) * (pml_e(e_dxi[offset], inv_scale_pml) * h2f(Vuxx[offset]) + uxx);
+	float pmlyVuy_new = h2f(pmlyVuy[offset]) * pml_e(e_dyj[offset], inv_scale_pml) + (-pml_dt_d(dyj[offset], inv_scale_pml) * 0.5f) * (pml_e(e_dyj[offset], inv_scale_pml) * h2f(Vuyy[offset]) + uyy);
+	float pmlzVuz_new = h2f(pmlzVuz[offset]) * pml_e(e_dzk[offset], inv_scale_pml) + (-pml_dt_d(dzk[offset], inv_scale_pml) * 0.5f) * (pml_e(e_dzk[offset], inv_scale_pml) * h2f(Vuzz[offset]) + uzz);
 	store_h(pmlxVux, offset, pmlxVux_new);
 	store_h(pmlyVuy, offset, pmlyVuy_new);
 	store_h(pmlzVuz, offset, pmlzVuz_new);
@@ -256,9 +324,9 @@ __global__ void FD_T(half* vux, half* vux_lo, half* vuy, half* vuy_lo, half* vuz
 	uzz = uzz + pmlzVuz_new;
 
 
-	float pmlxVwx_new = h2f(pmlxVwx[offset]) * e_dxi[offset] + (-DT * dxi[offset] * 0.5f) * (e_dxi[offset] * h2f(Vwxx[offset]) + wx);
-	float pmlyVwy_new = h2f(pmlyVwy[offset]) * e_dyj[offset] + (-DT * dyj[offset] * 0.5f) * (e_dyj[offset] * h2f(Vwyy[offset]) + wy);
-	float pmlzVwz_new = h2f(pmlzVwz[offset]) * e_dzk[offset] + (-DT * dzk[offset] * 0.5f) * (e_dzk[offset] * h2f(Vwzz[offset]) + wz);
+	float pmlxVwx_new = h2f(pmlxVwx[offset]) * pml_e(e_dxi[offset], inv_scale_pml) + (-pml_dt_d(dxi[offset], inv_scale_pml) * 0.5f) * (pml_e(e_dxi[offset], inv_scale_pml) * h2f(Vwxx[offset]) + wx);
+	float pmlyVwy_new = h2f(pmlyVwy[offset]) * pml_e(e_dyj[offset], inv_scale_pml) + (-pml_dt_d(dyj[offset], inv_scale_pml) * 0.5f) * (pml_e(e_dyj[offset], inv_scale_pml) * h2f(Vwyy[offset]) + wy);
+	float pmlzVwz_new = h2f(pmlzVwz[offset]) * pml_e(e_dzk[offset], inv_scale_pml) + (-pml_dt_d(dzk[offset], inv_scale_pml) * 0.5f) * (pml_e(e_dzk[offset], inv_scale_pml) * h2f(Vwzz[offset]) + wz);
 	store_h(pmlxVwx, offset, pmlxVwx_new);
 	store_h(pmlyVwy, offset, pmlyVwy_new);
 	store_h(pmlzVwz, offset, pmlzVwz_new);
@@ -267,24 +335,24 @@ __global__ void FD_T(half* vux, half* vux_lo, half* vuy, half* vuy_lo, half* vuz
 	wy = wy + pmlyVwy_new;
 	wz = wz + pmlzVwz_new;
 
-	float pmlxVuy_new = h2f(pmlxVuy[offset]) * e_dyj2[offset] + (-DT * dyj2[offset] * 0.5f) * (e_dyj2[offset] * h2f(Vuxy[offset]) + uxy);
-	float pmlyVux_new = h2f(pmlyVux[offset]) * e_dxi2[offset] + (-DT * dxi2[offset] * 0.5f) * (e_dxi2[offset] * h2f(Vuyx[offset]) + uyx);
+	float pmlxVuy_new = h2f(pmlxVuy[offset]) * pml_e(e_dyj2[offset], inv_scale_pml) + (-pml_dt_d(dyj2[offset], inv_scale_pml) * 0.5f) * (pml_e(e_dyj2[offset], inv_scale_pml) * h2f(Vuxy[offset]) + uxy);
+	float pmlyVux_new = h2f(pmlyVux[offset]) * pml_e(e_dxi2[offset], inv_scale_pml) + (-pml_dt_d(dxi2[offset], inv_scale_pml) * 0.5f) * (pml_e(e_dxi2[offset], inv_scale_pml) * h2f(Vuyx[offset]) + uyx);
 	store_h(pmlxVuy, offset, pmlxVuy_new);
 	store_h(pmlyVux, offset, pmlyVux_new);
 	store_h(Vuxy, offset, uxy); store_h(Vuyx, offset, uyx);
 	uxy = uxy + pmlxVuy_new;
 	uyx = uyx + pmlyVux_new;
 
-	float pmlxVuz_new = h2f(pmlxVuz[offset]) * e_dzk2[offset] + (-DT * dzk2[offset] * 0.5f) * (e_dzk2[offset] * h2f(Vuxz[offset]) + uxz);
-	float pmlzVux_new = h2f(pmlzVux[offset]) * e_dxi2[offset] + (-DT * dxi2[offset] * 0.5f) * (e_dxi2[offset] * h2f(Vuzx[offset]) + uzx);
+	float pmlxVuz_new = h2f(pmlxVuz[offset]) * pml_e(e_dzk2[offset], inv_scale_pml) + (-pml_dt_d(dzk2[offset], inv_scale_pml) * 0.5f) * (pml_e(e_dzk2[offset], inv_scale_pml) * h2f(Vuxz[offset]) + uxz);
+	float pmlzVux_new = h2f(pmlzVux[offset]) * pml_e(e_dxi2[offset], inv_scale_pml) + (-pml_dt_d(dxi2[offset], inv_scale_pml) * 0.5f) * (pml_e(e_dxi2[offset], inv_scale_pml) * h2f(Vuzx[offset]) + uzx);
 	store_h(pmlxVuz, offset, pmlxVuz_new);
 	store_h(pmlzVux, offset, pmlzVux_new);
 	store_h(Vuxz, offset, uxz); store_h(Vuzx, offset, uzx);
 	uxz = uxz + pmlxVuz_new;
 	uzx = uzx + pmlzVux_new;
 
-	float pmlyVuz_new = h2f(pmlyVuz[offset]) * e_dzk2[offset] + (-DT * dzk2[offset] * 0.5f) * (e_dzk2[offset] * h2f(Vuyz[offset]) + uyz);
-	float pmlzVuy_new = h2f(pmlzVuy[offset]) * e_dyj2[offset] + (-DT * dyj2[offset] * 0.5f) * (e_dyj2[offset] * h2f(Vuzy[offset]) + uzy);
+	float pmlyVuz_new = h2f(pmlyVuz[offset]) * pml_e(e_dzk2[offset], inv_scale_pml) + (-pml_dt_d(dzk2[offset], inv_scale_pml) * 0.5f) * (pml_e(e_dzk2[offset], inv_scale_pml) * h2f(Vuyz[offset]) + uyz);
+	float pmlzVuy_new = h2f(pmlzVuy[offset]) * pml_e(e_dyj2[offset], inv_scale_pml) + (-pml_dt_d(dyj2[offset], inv_scale_pml) * 0.5f) * (pml_e(e_dyj2[offset], inv_scale_pml) * h2f(Vuzy[offset]) + uzy);
 	store_h(pmlyVuz, offset, pmlyVuz_new);
 	store_h(pmlzVuy, offset, pmlzVuy_new);
 	store_h(Vuzy, offset, uzy); store_h(Vuyz, offset, uyz);
@@ -351,7 +419,8 @@ int main()
 	dim3 Gridsize = dim3(divUp(NX_ext, BLOCK_SIZE_X), divUp(NY_ext, BLOCK_SIZE_Y), divUp(NZ_ext, BLOCK_SIZE_Z)); //GPU中线程分配
 	const size_t elem_count = (size_t)NZ_ext * NY_ext * NX_ext;
 	size_t mem_size = elem_count * sizeof(float);     //float内存大小
-	size_t mem_size_half = elem_count * sizeof(half); //half内存大小
+	size_t mem_size_half = elem_count * sizeof(half);
+	size_t mem_size_res = elem_count * sizeof(signed char); //int8 residual内存大小
 	printf("gridsize = %d   %d    %d\n", divUp(NX_ext, BLOCK_SIZE_X), divUp(NY_ext, BLOCK_SIZE_Y), divUp(NZ_ext, BLOCK_SIZE_Z));
 	//---------------------------------------------------------------------------
 	//参数开辟内存
@@ -731,10 +800,47 @@ int main()
 	float scale_m = ldexpf(1.0f, em_int);
 	float inv_scale_m = ldexpf(1.0f, -em_int);
 	float source_scale = ldexpf(1.0f, es_int);
-	float stress_output_scale = ldexpf(1.0f, -es_int);
-	float velocity_output_scale = ldexpf(1.0f, em_int - es_int);
-	printf("mixed precision V2 compensated half wavefields: em=%d es=%d scale_m=%e inv_scale_m=%e source_scale=%e stress_output_scale=%e\n",
-		em_int, es_int, scale_m, inv_scale_m, source_scale, stress_output_scale);
+	float stress_base_output_scale = ldexpf(1.0f, -es_int);
+	float velocity_base_output_scale = ldexpf(1.0f, em_int - es_int);
+	float dynamic_scale = 1.0f;
+	float stress_output_scale = stress_base_output_scale / dynamic_scale;
+	float velocity_output_scale = velocity_base_output_scale / dynamic_scale;
+	printf("compressed residual dynamic scaling: em=%d es=%d scale_m=%e inv_scale_m=%e source_scale=%e dynamic_end=%e interval=%d\n",
+		em_int, es_int, scale_m, inv_scale_m, source_scale, (float)DYNAMIC_SCALE_END, DYNAMIC_SCALE_INTERVAL);
+
+	float pml_max = 0.0f;
+	for (int k = 0; k < NZ_ext; k++)
+	{
+		for (int j = 0; j < NY_ext; j++)
+		{
+			for (int i = 0; i < NX_ext; i++)
+			{
+				pml_max = fmaxf(pml_max, fabsf(DT * dxi[k][j][i]));
+				pml_max = fmaxf(pml_max, fabsf(DT * dxi2[k][j][i]));
+				pml_max = fmaxf(pml_max, fabsf(DT * dyj[k][j][i]));
+				pml_max = fmaxf(pml_max, fabsf(DT * dyj2[k][j][i]));
+				pml_max = fmaxf(pml_max, fabsf(DT * dzk[k][j][i]));
+				pml_max = fmaxf(pml_max, fabsf(DT * dzk2[k][j][i]));
+				pml_max = fmaxf(pml_max, fabsf(1.0f - e_dxi[k][j][i]));
+				pml_max = fmaxf(pml_max, fabsf(1.0f - e_dxi2[k][j][i]));
+				pml_max = fmaxf(pml_max, fabsf(1.0f - e_dyj[k][j][i]));
+				pml_max = fmaxf(pml_max, fabsf(1.0f - e_dyj2[k][j][i]));
+				pml_max = fmaxf(pml_max, fabsf(1.0f - e_dzk[k][j][i]));
+				pml_max = fmaxf(pml_max, fabsf(1.0f - e_dzk2[k][j][i]));
+			}
+		}
+	}
+	int epml_int = 0;
+	if (pml_max > 0.0f)
+	{
+		epml_int = (int)floorf(log2f(2048.0f / pml_max));
+		if (epml_int > 20) epml_int = 20;
+		if (epml_int < -20) epml_int = -20;
+	}
+	float scale_pml = ldexpf(1.0f, epml_int);
+	float inv_scale_pml = ldexpf(1.0f, -epml_int);
+	printf("PML half exponent scaling: epml=%d scale_pml=%e inv_scale_pml=%e pml_max=%e scaled_max=%e\n",
+		epml_int, scale_pml, inv_scale_pml, pml_max, pml_max * scale_pml);
 
 	//在主机端CPU定义缩放后参数，分配内存
 	half* h_rho_tempx = (half*)calloc(elem_count, sizeof(half));      // rho_inv_tildex
@@ -761,38 +867,38 @@ int main()
 	half* h_muxz = (half*)calloc(elem_count, sizeof(half));
 	//速度应力
 	half* h_vwx = (half*)calloc(elem_count, sizeof(half));
-	half* h_vwx_lo = (half*)calloc(elem_count, sizeof(half));
+	signed char* h_vwx_lo = (signed char*)calloc(elem_count, sizeof(signed char));
 	half* h_vwy = (half*)calloc(elem_count, sizeof(half));
-	half* h_vwy_lo = (half*)calloc(elem_count, sizeof(half));
+	signed char* h_vwy_lo = (signed char*)calloc(elem_count, sizeof(signed char));
 	half* h_vwz = (half*)calloc(elem_count, sizeof(half));
-	half* h_vwz_lo = (half*)calloc(elem_count, sizeof(half));
+	signed char* h_vwz_lo = (signed char*)calloc(elem_count, sizeof(signed char));
 	half* h_ss = (half*)calloc(elem_count, sizeof(half));
-	half* h_ss_lo = (half*)calloc(elem_count, sizeof(half));
+	signed char* h_ss_lo = (signed char*)calloc(elem_count, sizeof(signed char));
 	half* h_vux = (half*)calloc(elem_count, sizeof(half));
-	half* h_vux_lo = (half*)calloc(elem_count, sizeof(half));
+	signed char* h_vux_lo = (signed char*)calloc(elem_count, sizeof(signed char));
 	half* h_vuy = (half*)calloc(elem_count, sizeof(half));
-	half* h_vuy_lo = (half*)calloc(elem_count, sizeof(half));
+	signed char* h_vuy_lo = (signed char*)calloc(elem_count, sizeof(signed char));
 	half* h_vuz = (half*)calloc(elem_count, sizeof(half));
-	half* h_vuz_lo = (half*)calloc(elem_count, sizeof(half));
+	signed char* h_vuz_lo = (signed char*)calloc(elem_count, sizeof(signed char));
 	half* h_txx = (half*)calloc(elem_count, sizeof(half));
-	half* h_txx_lo = (half*)calloc(elem_count, sizeof(half));
+	signed char* h_txx_lo = (signed char*)calloc(elem_count, sizeof(signed char));
 	half* h_tyy = (half*)calloc(elem_count, sizeof(half));
-	half* h_tyy_lo = (half*)calloc(elem_count, sizeof(half));
+	signed char* h_tyy_lo = (signed char*)calloc(elem_count, sizeof(signed char));
 	half* h_tzz = (half*)calloc(elem_count, sizeof(half));
-	half* h_tzz_lo = (half*)calloc(elem_count, sizeof(half));
+	signed char* h_tzz_lo = (signed char*)calloc(elem_count, sizeof(signed char));
 	half* h_txz = (half*)calloc(elem_count, sizeof(half));
-	half* h_txz_lo = (half*)calloc(elem_count, sizeof(half));
+	signed char* h_txz_lo = (signed char*)calloc(elem_count, sizeof(signed char));
 	half* h_txy = (half*)calloc(elem_count, sizeof(half));
-	half* h_txy_lo = (half*)calloc(elem_count, sizeof(half));
+	signed char* h_txy_lo = (signed char*)calloc(elem_count, sizeof(signed char));
 	half* h_tyz = (half*)calloc(elem_count, sizeof(half));
-	half* h_tyz_lo = (half*)calloc(elem_count, sizeof(half));
+	signed char* h_tyz_lo = (signed char*)calloc(elem_count, sizeof(signed char));
 	//前一时刻的速度
 	half* h_vwx2 = (half*)calloc(elem_count, sizeof(half));
-	half* h_vwx2_lo = (half*)calloc(elem_count, sizeof(half));
+	signed char* h_vwx2_lo = (signed char*)calloc(elem_count, sizeof(signed char));
 	half* h_vwy2 = (half*)calloc(elem_count, sizeof(half));
-	half* h_vwy2_lo = (half*)calloc(elem_count, sizeof(half));
+	signed char* h_vwy2_lo = (signed char*)calloc(elem_count, sizeof(signed char));
 	half* h_vwz2 = (half*)calloc(elem_count, sizeof(half));
-	half* h_vwz2_lo = (half*)calloc(elem_count, sizeof(half));
+	signed char* h_vwz2_lo = (signed char*)calloc(elem_count, sizeof(signed char));
 	//pml内的差分值
 	half* h_pmlxSxx = (half*)calloc(elem_count, sizeof(half));
 	half* h_pmlySxy = (half*)calloc(elem_count, sizeof(half));
@@ -843,19 +949,19 @@ int main()
 	half* h_Vwxx = (half*)calloc(elem_count, sizeof(half));
 	half* h_Vwyy = (half*)calloc(elem_count, sizeof(half));
 	half* h_Vwzz = (half*)calloc(elem_count, sizeof(half));
-	//pml参数保留float，避免dxi/dyj/dzk超过FP16范围
-	float* h_dxi = (float*)calloc(elem_count, sizeof(float));
-	float* h_dyj = (float*)calloc(elem_count, sizeof(float));
-	float* h_dzk = (float*)calloc(elem_count, sizeof(float));
-	float* h_dxi2 = (float*)calloc(elem_count, sizeof(float));
-	float* h_dyj2 = (float*)calloc(elem_count, sizeof(float));
-	float* h_dzk2 = (float*)calloc(elem_count, sizeof(float));
-	float* h_e_dxi = (float*)calloc(elem_count, sizeof(float));
-	float* h_e_dyj = (float*)calloc(elem_count, sizeof(float));
-	float* h_e_dzk = (float*)calloc(elem_count, sizeof(float));
-	float* h_e_dxi2 = (float*)calloc(elem_count, sizeof(float));
-	float* h_e_dyj2 = (float*)calloc(elem_count, sizeof(float));
-	float* h_e_dzk2 = (float*)calloc(elem_count, sizeof(float));
+	//PML参数使用指数缩放后的half存储：d数组存 2^epml * DT * d，e数组存 2^epml * (1-e)
+	half* h_dxi = (half*)calloc(elem_count, sizeof(half));
+	half* h_dyj = (half*)calloc(elem_count, sizeof(half));
+	half* h_dzk = (half*)calloc(elem_count, sizeof(half));
+	half* h_dxi2 = (half*)calloc(elem_count, sizeof(half));
+	half* h_dyj2 = (half*)calloc(elem_count, sizeof(half));
+	half* h_dzk2 = (half*)calloc(elem_count, sizeof(half));
+	half* h_e_dxi = (half*)calloc(elem_count, sizeof(half));
+	half* h_e_dyj = (half*)calloc(elem_count, sizeof(half));
+	half* h_e_dzk = (half*)calloc(elem_count, sizeof(half));
+	half* h_e_dxi2 = (half*)calloc(elem_count, sizeof(half));
+	half* h_e_dyj2 = (half*)calloc(elem_count, sizeof(half));
+	half* h_e_dzk2 = (half*)calloc(elem_count, sizeof(half));
 
 	//在主机端将三维参数转化为一维缩放参数
 	for (int k = 0; k < NZ_ext; k++)
@@ -922,18 +1028,18 @@ int main()
 				h_muxy[idx] = __float2half(scale_m * DT * muxy[k][j][i]);
 				h_muyz[idx] = __float2half(scale_m * DT * muyz[k][j][i]);
 
-				h_dxi[idx] = dxi[k][j][i];
-				h_dyj[idx] = dyj[k][j][i];
-				h_dzk[idx] = dzk[k][j][i];
-				h_dxi2[idx] = dxi2[k][j][i];
-				h_dyj2[idx] = dyj2[k][j][i];
-				h_dzk2[idx] = dzk2[k][j][i];
-				h_e_dxi[idx] = e_dxi[k][j][i];
-				h_e_dyj[idx] = e_dyj[k][j][i];
-				h_e_dzk[idx] = e_dzk[k][j][i];
-				h_e_dxi2[idx] = e_dxi2[k][j][i];
-				h_e_dyj2[idx] = e_dyj2[k][j][i];
-				h_e_dzk2[idx] = e_dzk2[k][j][i];
+				h_dxi[idx] = __float2half(scale_pml * DT * dxi[k][j][i]);
+				h_dyj[idx] = __float2half(scale_pml * DT * dyj[k][j][i]);
+				h_dzk[idx] = __float2half(scale_pml * DT * dzk[k][j][i]);
+				h_dxi2[idx] = __float2half(scale_pml * DT * dxi2[k][j][i]);
+				h_dyj2[idx] = __float2half(scale_pml * DT * dyj2[k][j][i]);
+				h_dzk2[idx] = __float2half(scale_pml * DT * dzk2[k][j][i]);
+				h_e_dxi[idx] = __float2half(scale_pml * (1.0f - e_dxi[k][j][i]));
+				h_e_dyj[idx] = __float2half(scale_pml * (1.0f - e_dyj[k][j][i]));
+				h_e_dzk[idx] = __float2half(scale_pml * (1.0f - e_dzk[k][j][i]));
+				h_e_dxi2[idx] = __float2half(scale_pml * (1.0f - e_dxi2[k][j][i]));
+				h_e_dyj2[idx] = __float2half(scale_pml * (1.0f - e_dyj2[k][j][i]));
+				h_e_dzk2[idx] = __float2half(scale_pml * (1.0f - e_dzk2[k][j][i]));
 			}
 		}
 	}
@@ -944,31 +1050,31 @@ int main()
 	half* d_rhof_rho_invx, * d_rhof_rho_invy, * d_rhof_rho_invz;
 	half* d_Btx, * d_Bty, * d_Btz;
 	half* d_vux, * d_vuy, * d_vuz;
-	half* d_vux_lo, * d_vuy_lo, * d_vuz_lo;
+	signed char* d_vux_lo, * d_vuy_lo, * d_vuz_lo;
 	half* d_vwx, * d_vwy, * d_vwz;
-	half* d_vwx_lo, * d_vwy_lo, * d_vwz_lo;
+	signed char* d_vwx_lo, * d_vwy_lo, * d_vwz_lo;
 	half* d_vwx2, * d_vwy2, * d_vwz2;
-	half* d_vwx2_lo, * d_vwy2_lo, * d_vwz2_lo;
+	signed char* d_vwx2_lo, * d_vwy2_lo, * d_vwz2_lo;
 	half* d_txx, * d_tyy, * d_tzz, * d_txy, * d_tyz, * d_txz, * d_ss;
-	half* d_txx_lo, * d_tyy_lo, * d_tzz_lo, * d_txy_lo, * d_tyz_lo, * d_txz_lo, * d_ss_lo;
+	signed char* d_txx_lo, * d_tyy_lo, * d_tzz_lo, * d_txy_lo, * d_tyz_lo, * d_txz_lo, * d_ss_lo;
 	half* d_SXxx, * d_SXxy, * d_SXxz, * d_SYxy, * d_SYyy, * d_SYyz, * d_SZxz, * d_SZyz, * d_SZzz;
 	half* d_Vuxx, * d_Vuyy, * d_Vuzz, * d_Vuxy, * d_Vuyx, * d_Vuxz, * d_Vuzx, * d_Vuyz, * d_Vuzy;
 	half* d_pmlxSxx, * d_pmlySxy, * d_pmlzSxz, * d_pmlxSxy, * d_pmlySyy, * d_pmlzSyz, * d_pmlxSxz, * d_pmlySyz, * d_pmlzSzz;
 	half* d_pmlxVux, * d_pmlyVuy, * d_pmlzVuz, * d_pmlxVuy, * d_pmlyVux, * d_pmlxVuz, * d_pmlzVux, * d_pmlyVuz, * d_pmlzVuy;
 	half* d_pmlxVwx, * d_pmlyVwy, * d_pmlzVwz, * d_pmlxss, * d_pmlyss, * d_pmlzss;
 	half* d_SXss, * d_SYss, * d_SZss, * d_Vwxx, * d_Vwyy, * d_Vwzz;
-	float* d_dxi;
-	float* d_dyj;
-	float* d_dzk;
-	float* d_dxi2;
-	float* d_dyj2;
-	float* d_dzk2;
-	float* d_e_dxi;
-	float* d_e_dyj;
-	float* d_e_dzk;
-	float* d_e_dxi2;
-	float* d_e_dyj2;
-	float* d_e_dzk2;
+	half* d_dxi;
+	half* d_dyj;
+	half* d_dzk;
+	half* d_dxi2;
+	half* d_dyj2;
+	half* d_dzk2;
+	half* d_e_dxi;
+	half* d_e_dyj;
+	half* d_e_dzk;
+	half* d_e_dxi2;
+	half* d_e_dyj2;
+	half* d_e_dzk2;
 	half* d_C1x, * d_C1y, * d_C1z, * d_C2x, * d_C2y, * d_C2z;
 
 	cudaMalloc(&d_HH_ext, mem_size_half);
@@ -994,37 +1100,37 @@ int main()
 	cudaMalloc(&d_muyz, mem_size_half);
 	cudaMalloc(&d_muxy, mem_size_half);
 	cudaMalloc(&d_vux, mem_size_half);
-	cudaMalloc(&d_vux_lo, mem_size_half);
+	cudaMalloc(&d_vux_lo, mem_size_res);
 	cudaMalloc(&d_vuy, mem_size_half);
-	cudaMalloc(&d_vuy_lo, mem_size_half);
+	cudaMalloc(&d_vuy_lo, mem_size_res);
 	cudaMalloc(&d_vuz, mem_size_half);
-	cudaMalloc(&d_vuz_lo, mem_size_half);
+	cudaMalloc(&d_vuz_lo, mem_size_res);
 	cudaMalloc(&d_txx, mem_size_half);
-	cudaMalloc(&d_txx_lo, mem_size_half);
+	cudaMalloc(&d_txx_lo, mem_size_res);
 	cudaMalloc(&d_tyy, mem_size_half);
-	cudaMalloc(&d_tyy_lo, mem_size_half);
+	cudaMalloc(&d_tyy_lo, mem_size_res);
 	cudaMalloc(&d_tzz, mem_size_half);
-	cudaMalloc(&d_tzz_lo, mem_size_half);
+	cudaMalloc(&d_tzz_lo, mem_size_res);
 	cudaMalloc(&d_txz, mem_size_half);
-	cudaMalloc(&d_txz_lo, mem_size_half);
+	cudaMalloc(&d_txz_lo, mem_size_res);
 	cudaMalloc(&d_txy, mem_size_half);
-	cudaMalloc(&d_txy_lo, mem_size_half);
+	cudaMalloc(&d_txy_lo, mem_size_res);
 	cudaMalloc(&d_tyz, mem_size_half);
-	cudaMalloc(&d_tyz_lo, mem_size_half);
+	cudaMalloc(&d_tyz_lo, mem_size_res);
 	cudaMalloc(&d_ss, mem_size_half);
-	cudaMalloc(&d_ss_lo, mem_size_half);
+	cudaMalloc(&d_ss_lo, mem_size_res);
 	cudaMalloc(&d_vwx, mem_size_half);
-	cudaMalloc(&d_vwx_lo, mem_size_half);
+	cudaMalloc(&d_vwx_lo, mem_size_res);
 	cudaMalloc(&d_vwy, mem_size_half);
-	cudaMalloc(&d_vwy_lo, mem_size_half);
+	cudaMalloc(&d_vwy_lo, mem_size_res);
 	cudaMalloc(&d_vwz, mem_size_half);
-	cudaMalloc(&d_vwz_lo, mem_size_half);
+	cudaMalloc(&d_vwz_lo, mem_size_res);
 	cudaMalloc(&d_vwx2, mem_size_half);
-	cudaMalloc(&d_vwx2_lo, mem_size_half);
+	cudaMalloc(&d_vwx2_lo, mem_size_res);
 	cudaMalloc(&d_vwy2, mem_size_half);
-	cudaMalloc(&d_vwy2_lo, mem_size_half);
+	cudaMalloc(&d_vwy2_lo, mem_size_res);
 	cudaMalloc(&d_vwz2, mem_size_half);
-	cudaMalloc(&d_vwz2_lo, mem_size_half);
+	cudaMalloc(&d_vwz2_lo, mem_size_res);
 	cudaMalloc(&d_pmlxSxx, mem_size_half);
 	cudaMalloc(&d_pmlySxy, mem_size_half);
 	cudaMalloc(&d_pmlzSxz, mem_size_half);
@@ -1073,18 +1179,18 @@ int main()
 	cudaMalloc(&d_Vwxx, mem_size_half);
 	cudaMalloc(&d_Vwyy, mem_size_half);
 	cudaMalloc(&d_Vwzz, mem_size_half);
-	cudaMalloc(&d_dxi, mem_size);
-	cudaMalloc(&d_dyj, mem_size);
-	cudaMalloc(&d_dzk, mem_size);
-	cudaMalloc(&d_dxi2, mem_size);
-	cudaMalloc(&d_dyj2, mem_size);
-	cudaMalloc(&d_dzk2, mem_size);
-	cudaMalloc(&d_e_dxi, mem_size);
-	cudaMalloc(&d_e_dyj, mem_size);
-	cudaMalloc(&d_e_dzk, mem_size);
-	cudaMalloc(&d_e_dxi2, mem_size);
-	cudaMalloc(&d_e_dyj2, mem_size);
-	cudaMalloc(&d_e_dzk2, mem_size);
+	cudaMalloc(&d_dxi, mem_size_half);
+	cudaMalloc(&d_dyj, mem_size_half);
+	cudaMalloc(&d_dzk, mem_size_half);
+	cudaMalloc(&d_dxi2, mem_size_half);
+	cudaMalloc(&d_dyj2, mem_size_half);
+	cudaMalloc(&d_dzk2, mem_size_half);
+	cudaMalloc(&d_e_dxi, mem_size_half);
+	cudaMalloc(&d_e_dyj, mem_size_half);
+	cudaMalloc(&d_e_dzk, mem_size_half);
+	cudaMalloc(&d_e_dxi2, mem_size_half);
+	cudaMalloc(&d_e_dyj2, mem_size_half);
+	cudaMalloc(&d_e_dzk2, mem_size_half);
 	//---------------------------------------------------------------------------------------------
 	//开始时间递推
 	//这里的代码应该修正一下，应该从数据里面提取最大最小速度
@@ -1107,23 +1213,23 @@ int main()
 	cudaMemcpy(d_muxy, h_muxy, mem_size_half, cudaMemcpyHostToDevice);
 	cudaMemcpy(d_muyz, h_muyz, mem_size_half, cudaMemcpyHostToDevice);
 	cudaMemcpy(d_vux, h_vux, mem_size_half, cudaMemcpyHostToDevice);
-	cudaMemcpy(d_vux_lo, h_vux_lo, mem_size_half, cudaMemcpyHostToDevice);
+	cudaMemcpy(d_vux_lo, h_vux_lo, mem_size_res, cudaMemcpyHostToDevice);
 	cudaMemcpy(d_vuy, h_vuy, mem_size_half, cudaMemcpyHostToDevice);
-	cudaMemcpy(d_vuy_lo, h_vuy_lo, mem_size_half, cudaMemcpyHostToDevice);
+	cudaMemcpy(d_vuy_lo, h_vuy_lo, mem_size_res, cudaMemcpyHostToDevice);
 	cudaMemcpy(d_vuz, h_vuz, mem_size_half, cudaMemcpyHostToDevice);
-	cudaMemcpy(d_vuz_lo, h_vuz_lo, mem_size_half, cudaMemcpyHostToDevice);
+	cudaMemcpy(d_vuz_lo, h_vuz_lo, mem_size_res, cudaMemcpyHostToDevice);
 	cudaMemcpy(d_txx, h_txx, mem_size_half, cudaMemcpyHostToDevice);
-	cudaMemcpy(d_txx_lo, h_txx_lo, mem_size_half, cudaMemcpyHostToDevice);
+	cudaMemcpy(d_txx_lo, h_txx_lo, mem_size_res, cudaMemcpyHostToDevice);
 	cudaMemcpy(d_tyy, h_tyy, mem_size_half, cudaMemcpyHostToDevice);
-	cudaMemcpy(d_tyy_lo, h_tyy_lo, mem_size_half, cudaMemcpyHostToDevice);
+	cudaMemcpy(d_tyy_lo, h_tyy_lo, mem_size_res, cudaMemcpyHostToDevice);
 	cudaMemcpy(d_tzz, h_tzz, mem_size_half, cudaMemcpyHostToDevice);
-	cudaMemcpy(d_tzz_lo, h_tzz_lo, mem_size_half, cudaMemcpyHostToDevice);
+	cudaMemcpy(d_tzz_lo, h_tzz_lo, mem_size_res, cudaMemcpyHostToDevice);
 	cudaMemcpy(d_txy, h_txy, mem_size_half, cudaMemcpyHostToDevice);
-	cudaMemcpy(d_txy_lo, h_txy_lo, mem_size_half, cudaMemcpyHostToDevice);
+	cudaMemcpy(d_txy_lo, h_txy_lo, mem_size_res, cudaMemcpyHostToDevice);
 	cudaMemcpy(d_txz, h_txz, mem_size_half, cudaMemcpyHostToDevice);
-	cudaMemcpy(d_txz_lo, h_txz_lo, mem_size_half, cudaMemcpyHostToDevice);
+	cudaMemcpy(d_txz_lo, h_txz_lo, mem_size_res, cudaMemcpyHostToDevice);
 	cudaMemcpy(d_tyz, h_tyz, mem_size_half, cudaMemcpyHostToDevice);
-	cudaMemcpy(d_tyz_lo, h_tyz_lo, mem_size_half, cudaMemcpyHostToDevice);
+	cudaMemcpy(d_tyz_lo, h_tyz_lo, mem_size_res, cudaMemcpyHostToDevice);
 	cudaMemcpy(d_pmlxSxx, h_pmlxSxx, mem_size_half, cudaMemcpyHostToDevice);
 	cudaMemcpy(d_pmlySxy, h_pmlySxy, mem_size_half, cudaMemcpyHostToDevice);
 	cudaMemcpy(d_pmlzSxz, h_pmlzSxz, mem_size_half, cudaMemcpyHostToDevice);
@@ -1160,18 +1266,18 @@ int main()
 	cudaMemcpy(d_Vuzx, h_Vuzx, mem_size_half, cudaMemcpyHostToDevice);
 	cudaMemcpy(d_Vuyz, h_Vuyz, mem_size_half, cudaMemcpyHostToDevice);
 	cudaMemcpy(d_Vuzy, h_Vuzy, mem_size_half, cudaMemcpyHostToDevice);
-	cudaMemcpy(d_dxi, h_dxi, mem_size, cudaMemcpyHostToDevice);
-	cudaMemcpy(d_dyj, h_dyj, mem_size, cudaMemcpyHostToDevice);
-	cudaMemcpy(d_dzk, h_dzk, mem_size, cudaMemcpyHostToDevice);
-	cudaMemcpy(d_dxi2, h_dxi2, mem_size, cudaMemcpyHostToDevice);
-	cudaMemcpy(d_dyj2, h_dyj2, mem_size, cudaMemcpyHostToDevice);
-	cudaMemcpy(d_dzk2, h_dzk2, mem_size, cudaMemcpyHostToDevice);
-	cudaMemcpy(d_e_dxi, h_e_dxi, mem_size, cudaMemcpyHostToDevice);
-	cudaMemcpy(d_e_dyj, h_e_dyj, mem_size, cudaMemcpyHostToDevice);
-	cudaMemcpy(d_e_dzk, h_e_dzk, mem_size, cudaMemcpyHostToDevice);
-	cudaMemcpy(d_e_dxi2, h_e_dxi2, mem_size, cudaMemcpyHostToDevice);
-	cudaMemcpy(d_e_dyj2, h_e_dyj2, mem_size, cudaMemcpyHostToDevice);
-	cudaMemcpy(d_e_dzk2, h_e_dzk2, mem_size, cudaMemcpyHostToDevice);
+	cudaMemcpy(d_dxi, h_dxi, mem_size_half, cudaMemcpyHostToDevice);
+	cudaMemcpy(d_dyj, h_dyj, mem_size_half, cudaMemcpyHostToDevice);
+	cudaMemcpy(d_dzk, h_dzk, mem_size_half, cudaMemcpyHostToDevice);
+	cudaMemcpy(d_dxi2, h_dxi2, mem_size_half, cudaMemcpyHostToDevice);
+	cudaMemcpy(d_dyj2, h_dyj2, mem_size_half, cudaMemcpyHostToDevice);
+	cudaMemcpy(d_dzk2, h_dzk2, mem_size_half, cudaMemcpyHostToDevice);
+	cudaMemcpy(d_e_dxi, h_e_dxi, mem_size_half, cudaMemcpyHostToDevice);
+	cudaMemcpy(d_e_dyj, h_e_dyj, mem_size_half, cudaMemcpyHostToDevice);
+	cudaMemcpy(d_e_dzk, h_e_dzk, mem_size_half, cudaMemcpyHostToDevice);
+	cudaMemcpy(d_e_dxi2, h_e_dxi2, mem_size_half, cudaMemcpyHostToDevice);
+	cudaMemcpy(d_e_dyj2, h_e_dyj2, mem_size_half, cudaMemcpyHostToDevice);
+	cudaMemcpy(d_e_dzk2, h_e_dzk2, mem_size_half, cudaMemcpyHostToDevice);
 	cudaMemcpy(d_pmlxVwx, h_pmlxVwx, mem_size_half, cudaMemcpyHostToDevice);
 	cudaMemcpy(d_pmlyVwy, h_pmlyVwy, mem_size_half, cudaMemcpyHostToDevice);
 	cudaMemcpy(d_pmlzVwz, h_pmlzVwz, mem_size_half, cudaMemcpyHostToDevice);
@@ -1185,19 +1291,19 @@ int main()
 	cudaMemcpy(d_Vwyy, h_Vwyy, mem_size_half, cudaMemcpyHostToDevice);
 	cudaMemcpy(d_Vwzz, h_Vwzz, mem_size_half, cudaMemcpyHostToDevice);
 	cudaMemcpy(d_ss, h_ss, mem_size_half, cudaMemcpyHostToDevice);
-	cudaMemcpy(d_ss_lo, h_ss_lo, mem_size_half, cudaMemcpyHostToDevice);
+	cudaMemcpy(d_ss_lo, h_ss_lo, mem_size_res, cudaMemcpyHostToDevice);
 	cudaMemcpy(d_vwx, h_vwx, mem_size_half, cudaMemcpyHostToDevice);
-	cudaMemcpy(d_vwx_lo, h_vwx_lo, mem_size_half, cudaMemcpyHostToDevice);
+	cudaMemcpy(d_vwx_lo, h_vwx_lo, mem_size_res, cudaMemcpyHostToDevice);
 	cudaMemcpy(d_vwy, h_vwy, mem_size_half, cudaMemcpyHostToDevice);
-	cudaMemcpy(d_vwy_lo, h_vwy_lo, mem_size_half, cudaMemcpyHostToDevice);
+	cudaMemcpy(d_vwy_lo, h_vwy_lo, mem_size_res, cudaMemcpyHostToDevice);
 	cudaMemcpy(d_vwz, h_vwz, mem_size_half, cudaMemcpyHostToDevice);
-	cudaMemcpy(d_vwz_lo, h_vwz_lo, mem_size_half, cudaMemcpyHostToDevice);
+	cudaMemcpy(d_vwz_lo, h_vwz_lo, mem_size_res, cudaMemcpyHostToDevice);
 	cudaMemcpy(d_vwx2, h_vwx2, mem_size_half, cudaMemcpyHostToDevice);
-	cudaMemcpy(d_vwx2_lo, h_vwx2_lo, mem_size_half, cudaMemcpyHostToDevice);
+	cudaMemcpy(d_vwx2_lo, h_vwx2_lo, mem_size_res, cudaMemcpyHostToDevice);
 	cudaMemcpy(d_vwy2, h_vwy2, mem_size_half, cudaMemcpyHostToDevice);
-	cudaMemcpy(d_vwy2_lo, h_vwy2_lo, mem_size_half, cudaMemcpyHostToDevice);
+	cudaMemcpy(d_vwy2_lo, h_vwy2_lo, mem_size_res, cudaMemcpyHostToDevice);
 	cudaMemcpy(d_vwz2, h_vwz2, mem_size_half, cudaMemcpyHostToDevice);
-	cudaMemcpy(d_vwz2_lo, h_vwz2_lo, mem_size_half, cudaMemcpyHostToDevice);
+	cudaMemcpy(d_vwz2_lo, h_vwz2_lo, mem_size_res, cudaMemcpyHostToDevice);
 	cudaMemcpy(d_HH_ext, h_HH_ext, mem_size_half, cudaMemcpyHostToDevice);
 	cudaMemcpy(d_H2u_ext, h_H2u_ext, mem_size_half, cudaMemcpyHostToDevice);
 	cudaMemcpy(d_C_ext, h_C_ext, mem_size_half, cudaMemcpyHostToDevice);
@@ -1217,6 +1323,45 @@ int main()
 	for (it = 0; it < NT; it++)
 	{
 		float tt = it * DT;
+		if (it == 0 || (DYNAMIC_SCALE_INTERVAL > 0 && it % DYNAMIC_SCALE_INTERVAL == 0))
+		{
+			float target_scale = dynamic_scale_for_step(it, NT);
+			float scale_ratio = target_scale / dynamic_scale;
+			if (fabsf(scale_ratio - 1.0f) > 1.0e-6f)
+			{
+				dim3 ScaleBlock(256, 1, 1);
+				dim3 ScaleGrid(divUp((int)elem_count, 256), 1, 1);
+#define SCALE_COMPRESSED_ARRAY(hi, lo) ScaleCompressedArray<<<ScaleGrid, ScaleBlock>>>(hi, lo, scale_ratio, (int)elem_count)
+#define SCALE_HALF_STATE_ARRAY(ptr) ScaleHalfArray<<<ScaleGrid, ScaleBlock>>>(ptr, scale_ratio, (int)elem_count)
+				SCALE_COMPRESSED_ARRAY(d_vux, d_vux_lo); SCALE_COMPRESSED_ARRAY(d_vuy, d_vuy_lo); SCALE_COMPRESSED_ARRAY(d_vuz, d_vuz_lo);
+				SCALE_COMPRESSED_ARRAY(d_vwx, d_vwx_lo); SCALE_COMPRESSED_ARRAY(d_vwy, d_vwy_lo); SCALE_COMPRESSED_ARRAY(d_vwz, d_vwz_lo);
+				SCALE_COMPRESSED_ARRAY(d_vwx2, d_vwx2_lo); SCALE_COMPRESSED_ARRAY(d_vwy2, d_vwy2_lo); SCALE_COMPRESSED_ARRAY(d_vwz2, d_vwz2_lo);
+				SCALE_COMPRESSED_ARRAY(d_txx, d_txx_lo); SCALE_COMPRESSED_ARRAY(d_tyy, d_tyy_lo); SCALE_COMPRESSED_ARRAY(d_tzz, d_tzz_lo);
+				SCALE_COMPRESSED_ARRAY(d_txz, d_txz_lo); SCALE_COMPRESSED_ARRAY(d_txy, d_txy_lo); SCALE_COMPRESSED_ARRAY(d_tyz, d_tyz_lo); SCALE_COMPRESSED_ARRAY(d_ss, d_ss_lo);
+				SCALE_HALF_STATE_ARRAY(d_pmlxSxx); SCALE_HALF_STATE_ARRAY(d_pmlySxy); SCALE_HALF_STATE_ARRAY(d_pmlzSxz);
+				SCALE_HALF_STATE_ARRAY(d_pmlxSxy); SCALE_HALF_STATE_ARRAY(d_pmlySyy); SCALE_HALF_STATE_ARRAY(d_pmlzSyz);
+				SCALE_HALF_STATE_ARRAY(d_pmlxSxz); SCALE_HALF_STATE_ARRAY(d_pmlySyz); SCALE_HALF_STATE_ARRAY(d_pmlzSzz);
+				SCALE_HALF_STATE_ARRAY(d_pmlxss); SCALE_HALF_STATE_ARRAY(d_pmlyss); SCALE_HALF_STATE_ARRAY(d_pmlzss);
+				SCALE_HALF_STATE_ARRAY(d_SXxx); SCALE_HALF_STATE_ARRAY(d_SXxy); SCALE_HALF_STATE_ARRAY(d_SXxz);
+				SCALE_HALF_STATE_ARRAY(d_SYxy); SCALE_HALF_STATE_ARRAY(d_SYyy); SCALE_HALF_STATE_ARRAY(d_SYyz);
+				SCALE_HALF_STATE_ARRAY(d_SZxz); SCALE_HALF_STATE_ARRAY(d_SZyz); SCALE_HALF_STATE_ARRAY(d_SZzz);
+				SCALE_HALF_STATE_ARRAY(d_SXss); SCALE_HALF_STATE_ARRAY(d_SYss); SCALE_HALF_STATE_ARRAY(d_SZss);
+				SCALE_HALF_STATE_ARRAY(d_pmlxVux); SCALE_HALF_STATE_ARRAY(d_pmlyVuy); SCALE_HALF_STATE_ARRAY(d_pmlzVuz);
+				SCALE_HALF_STATE_ARRAY(d_pmlxVuy); SCALE_HALF_STATE_ARRAY(d_pmlyVux); SCALE_HALF_STATE_ARRAY(d_pmlxVuz);
+				SCALE_HALF_STATE_ARRAY(d_pmlzVux); SCALE_HALF_STATE_ARRAY(d_pmlyVuz); SCALE_HALF_STATE_ARRAY(d_pmlzVuy);
+				SCALE_HALF_STATE_ARRAY(d_pmlxVwx); SCALE_HALF_STATE_ARRAY(d_pmlyVwy); SCALE_HALF_STATE_ARRAY(d_pmlzVwz);
+				SCALE_HALF_STATE_ARRAY(d_Vuxx); SCALE_HALF_STATE_ARRAY(d_Vuyy); SCALE_HALF_STATE_ARRAY(d_Vuzz);
+				SCALE_HALF_STATE_ARRAY(d_Vuxy); SCALE_HALF_STATE_ARRAY(d_Vuyx); SCALE_HALF_STATE_ARRAY(d_Vuxz);
+				SCALE_HALF_STATE_ARRAY(d_Vuzx); SCALE_HALF_STATE_ARRAY(d_Vuyz); SCALE_HALF_STATE_ARRAY(d_Vuzy);
+				SCALE_HALF_STATE_ARRAY(d_Vwxx); SCALE_HALF_STATE_ARRAY(d_Vwyy); SCALE_HALF_STATE_ARRAY(d_Vwzz);
+#undef SCALE_HALF_STATE_ARRAY
+#undef SCALE_COMPRESSED_ARRAY
+				cudaDeviceSynchronize();
+				dynamic_scale = target_scale;
+				stress_output_scale = stress_base_output_scale / dynamic_scale;
+				velocity_output_scale = velocity_base_output_scale / dynamic_scale;
+			}
+		}
 		if (it % 100 == 0)
 		{
 			printf("it=%d\n", it);
@@ -1226,45 +1371,45 @@ int main()
 			//加震源
 			float I_sou;
 			I_sou = -(1 - 2 * PI * PI * F0 * F0 * (tt - T0) * (tt - T0)) * exp(-PI * PI * F0 * F0 * (tt - T0) * (tt - T0));
-			Source << <Gridsize, Blocksize >> > (d_txx, d_txx_lo, d_tyy, d_tyy_lo, d_tzz, d_tzz_lo, source_scale * I_sou, sn, NX_ext, NY_ext, NZ_ext);
+			Source << <Gridsize, Blocksize >> > (d_txx, d_txx_lo, d_tyy, d_tyy_lo, d_tzz, d_tzz_lo, dynamic_scale * source_scale * I_sou, sn, NX_ext, NY_ext, NZ_ext);
 			cudaDeviceSynchronize();
 		}
 		//----------------------------------------------------------------------------------------------------
 		////////计算速度
-		FD_V << <Gridsize, Blocksize >> > (d_vux, d_vux_lo, d_vuy, d_vuy_lo, d_vuz, d_vuz_lo, d_rho_tempx, d_rho_tempy, d_rho_tempz, d_txx, d_txx_lo, d_tyy, d_tyy_lo, d_tzz, d_tzz_lo, d_txz, d_txz_lo, d_txy, d_txy_lo, d_tyz, d_tyz_lo, d_pmlxSxx, d_pmlySxy, d_pmlzSxz, d_pmlxSxy, d_pmlySyy, d_pmlzSyz, d_pmlxSxz, d_pmlySyz, d_pmlzSzz, d_SXxx, d_SXxy, d_SXxz, d_SYxy, d_SYyy, d_SYyz, d_SZxz, d_SZyz, d_SZzz, d_e_dxi, d_dxi, d_e_dxi2, d_dxi2, d_e_dyj, d_dyj, d_e_dyj2, d_dyj2, d_e_dzk, d_dzk, d_dzk2, d_e_dzk2, d_ss, d_ss_lo, d_vwx, d_vwx_lo, d_vwy, d_vwy_lo, d_vwz, d_vwz_lo, d_vwx2, d_vwx2_lo, d_vwy2, d_vwy2_lo, d_vwz2, d_vwz2_lo, d_SXss, d_SYss, d_SZss, d_pmlxss, d_pmlyss, d_pmlzss, d_C1x, d_C1y, d_C1z, d_C2x, d_C2y, d_C2z, d_Btx, d_Bty, d_Btz, d_rhof_rho_invx, d_rhof_rho_invy, d_rhof_rho_invz, DT);
+		FD_V << <Gridsize, Blocksize >> > (d_vux, d_vux_lo, d_vuy, d_vuy_lo, d_vuz, d_vuz_lo, d_rho_tempx, d_rho_tempy, d_rho_tempz, d_txx, d_txx_lo, d_tyy, d_tyy_lo, d_tzz, d_tzz_lo, d_txz, d_txz_lo, d_txy, d_txy_lo, d_tyz, d_tyz_lo, d_pmlxSxx, d_pmlySxy, d_pmlzSxz, d_pmlxSxy, d_pmlySyy, d_pmlzSyz, d_pmlxSxz, d_pmlySyz, d_pmlzSzz, d_SXxx, d_SXxy, d_SXxz, d_SYxy, d_SYyy, d_SYyz, d_SZxz, d_SZyz, d_SZzz, d_e_dxi, d_dxi, d_e_dxi2, d_dxi2, d_e_dyj, d_dyj, d_e_dyj2, d_dyj2, d_e_dzk, d_dzk, d_dzk2, d_e_dzk2, d_ss, d_ss_lo, d_vwx, d_vwx_lo, d_vwy, d_vwy_lo, d_vwz, d_vwz_lo, d_vwx2, d_vwx2_lo, d_vwy2, d_vwy2_lo, d_vwz2, d_vwz2_lo, d_SXss, d_SYss, d_SZss, d_pmlxss, d_pmlyss, d_pmlzss, d_C1x, d_C1y, d_C1z, d_C2x, d_C2y, d_C2z, d_Btx, d_Bty, d_Btz, d_rhof_rho_invx, d_rhof_rho_invy, d_rhof_rho_invz, inv_scale_pml, DT);
 		cudaDeviceSynchronize();
 		////----------------------------------------------------------------------------------------------------------
 		////计算应力
-		FD_T << <Gridsize, Blocksize >> > (d_vux, d_vux_lo, d_vuy, d_vuy_lo, d_vuz, d_vuz_lo, d_txx, d_txx_lo, d_tzz, d_tzz_lo, d_tyy, d_tyy_lo, d_txz, d_txz_lo, d_txy, d_txy_lo, d_tyz, d_tyz_lo, d_pmlxVux, d_muxy, d_muxz, d_muyz, d_pmlyVuy, d_pmlzVuz, d_pmlxVuy, d_pmlyVux, d_pmlyVuz, d_pmlzVuy, d_pmlzVux, d_pmlxVuz, d_Vuxx, d_Vuxy, d_Vuxz, d_Vuyx, d_Vuyy, d_Vuyz, d_Vuzx, d_Vuzy, d_Vuzz, d_e_dxi, d_dxi, d_e_dxi2, d_dxi2, d_e_dyj2, d_dyj2, d_e_dyj, d_dyj, d_dzk2, d_e_dzk2, d_e_dzk, d_dzk, d_Vwxx, d_Vwyy, d_Vwzz, d_vwx, d_vwx_lo, d_vwy, d_vwy_lo, d_vwz, d_vwz_lo, d_C_ext, d_M_ext, d_HH_ext, d_H2u_ext, d_ss, d_ss_lo, d_pmlxVwx, d_pmlyVwy, d_pmlzVwz, DT);
+		FD_T << <Gridsize, Blocksize >> > (d_vux, d_vux_lo, d_vuy, d_vuy_lo, d_vuz, d_vuz_lo, d_txx, d_txx_lo, d_tzz, d_tzz_lo, d_tyy, d_tyy_lo, d_txz, d_txz_lo, d_txy, d_txy_lo, d_tyz, d_tyz_lo, d_pmlxVux, d_muxy, d_muxz, d_muyz, d_pmlyVuy, d_pmlzVuz, d_pmlxVuy, d_pmlyVux, d_pmlyVuz, d_pmlzVuy, d_pmlzVux, d_pmlxVuz, d_Vuxx, d_Vuxy, d_Vuxz, d_Vuyx, d_Vuyy, d_Vuyz, d_Vuzx, d_Vuzy, d_Vuzz, d_e_dxi, d_dxi, d_e_dxi2, d_dxi2, d_e_dyj2, d_dyj2, d_e_dyj, d_dyj, d_dzk2, d_e_dzk2, d_e_dzk, d_dzk, d_Vwxx, d_Vwyy, d_Vwzz, d_vwx, d_vwx_lo, d_vwy, d_vwy_lo, d_vwz, d_vwz_lo, d_C_ext, d_M_ext, d_HH_ext, d_H2u_ext, d_ss, d_ss_lo, d_pmlxVwx, d_pmlyVwy, d_pmlzVwz, inv_scale_pml, DT);
 		cudaDeviceSynchronize();
 		//----------------------------------------------------------------------------------------------------------
 		//将速度，应力从设备端拷贝到主机
 		cudaMemcpy(h_txx, d_txx, mem_size_half, cudaMemcpyDeviceToHost);
-		cudaMemcpy(h_txx_lo, d_txx_lo, mem_size_half, cudaMemcpyDeviceToHost);
+		cudaMemcpy(h_txx_lo, d_txx_lo, mem_size_res, cudaMemcpyDeviceToHost);
 		cudaMemcpy(h_tzz, d_tzz, mem_size_half, cudaMemcpyDeviceToHost);
-		cudaMemcpy(h_tzz_lo, d_tzz_lo, mem_size_half, cudaMemcpyDeviceToHost);
+		cudaMemcpy(h_tzz_lo, d_tzz_lo, mem_size_res, cudaMemcpyDeviceToHost);
 		cudaMemcpy(h_ss, d_ss, mem_size_half, cudaMemcpyDeviceToHost);
-		cudaMemcpy(h_ss_lo, d_ss_lo, mem_size_half, cudaMemcpyDeviceToHost);
+		cudaMemcpy(h_ss_lo, d_ss_lo, mem_size_res, cudaMemcpyDeviceToHost);
 		cudaMemcpy(h_vux, d_vux, mem_size_half, cudaMemcpyDeviceToHost);
-		cudaMemcpy(h_vux_lo, d_vux_lo, mem_size_half, cudaMemcpyDeviceToHost);
+		cudaMemcpy(h_vux_lo, d_vux_lo, mem_size_res, cudaMemcpyDeviceToHost);
 		cudaMemcpy(h_vwx, d_vwx, mem_size_half, cudaMemcpyDeviceToHost);
-		cudaMemcpy(h_vwx_lo, d_vwx_lo, mem_size_half, cudaMemcpyDeviceToHost);
+		cudaMemcpy(h_vwx_lo, d_vwx_lo, mem_size_res, cudaMemcpyDeviceToHost);
 		cudaMemcpy(h_vuz, d_vuz, mem_size_half, cudaMemcpyDeviceToHost);
-		cudaMemcpy(h_vuz_lo, d_vuz_lo, mem_size_half, cudaMemcpyDeviceToHost);
+		cudaMemcpy(h_vuz_lo, d_vuz_lo, mem_size_res, cudaMemcpyDeviceToHost);
 		cudaMemcpy(h_vwz, d_vwz, mem_size_half, cudaMemcpyDeviceToHost);
-		cudaMemcpy(h_vwz_lo, d_vwz_lo, mem_size_half, cudaMemcpyDeviceToHost);
+		cudaMemcpy(h_vwz_lo, d_vwz_lo, mem_size_res, cudaMemcpyDeviceToHost);
 
 		//记录地震记录
 
 		for (iz = 0; iz < NZ_ext; iz++)
 		{
 			int rec_idx = iz * NX_ext * NY_ext + sx + sy * NX_ext;
-			sis_x[iz][it] = stress_output_scale * (__half2float(h_txx[rec_idx]) + __half2float(h_txx_lo[rec_idx]));
-			sis_z[iz][it] = stress_output_scale * (__half2float(h_tzz[rec_idx]) + __half2float(h_tzz_lo[rec_idx]));
+			sis_x[iz][it] = stress_output_scale * load_cr_host(h_txx, h_txx_lo, rec_idx);
+			sis_z[iz][it] = stress_output_scale * load_cr_host(h_tzz, h_tzz_lo, rec_idx);
 
-			sis_vu[iz][it] = velocity_output_scale * (__half2float(h_vux[rec_idx]) + __half2float(h_vux_lo[rec_idx]));
-			sis_vw[iz][it] = velocity_output_scale * (__half2float(h_vwx[rec_idx]) + __half2float(h_vwx_lo[rec_idx]));
-			sis_p[iz][it] = stress_output_scale * (__half2float(h_ss[rec_idx]) + __half2float(h_ss_lo[rec_idx]));
+			sis_vu[iz][it] = velocity_output_scale * load_cr_host(h_vux, h_vux_lo, rec_idx);
+			sis_vw[iz][it] = velocity_output_scale * load_cr_host(h_vwx, h_vwx_lo, rec_idx);
+			sis_p[iz][it] = stress_output_scale * load_cr_host(h_ss, h_ss_lo, rec_idx);
 		}
 		if (it == 500)
 			for (int k = 0; k < NZ_ext; k++)
@@ -1274,11 +1419,11 @@ int main()
 					for (int i = 0; i < NX_ext; i++)
 					{
 						int idx = i + j * NX_ext + k * NX_ext * NY_ext;
-						txx50[k][j][i] = stress_output_scale * (__half2float(h_txx[idx]) + __half2float(h_txx_lo[idx]));
-						vux50[k][j][i] = velocity_output_scale * (__half2float(h_vux[idx]) + __half2float(h_vux_lo[idx]));
-						vwx50[k][j][i] = velocity_output_scale * (__half2float(h_vwx[idx]) + __half2float(h_vwx_lo[idx]));
-						vuz50[k][j][i] = velocity_output_scale * (__half2float(h_vuz[idx]) + __half2float(h_vuz_lo[idx]));
-						vwz50[k][j][i] = velocity_output_scale * (__half2float(h_vwz[idx]) + __half2float(h_vwz_lo[idx]));
+						txx50[k][j][i] = stress_output_scale * load_cr_host(h_txx, h_txx_lo, idx);
+						vux50[k][j][i] = velocity_output_scale * load_cr_host(h_vux, h_vux_lo, idx);
+						vwx50[k][j][i] = velocity_output_scale * load_cr_host(h_vwx, h_vwx_lo, idx);
+						vuz50[k][j][i] = velocity_output_scale * load_cr_host(h_vuz, h_vuz_lo, idx);
+						vwz50[k][j][i] = velocity_output_scale * load_cr_host(h_vwz, h_vwz_lo, idx);
 					}
 				}
 			}
@@ -1289,7 +1434,7 @@ int main()
 				{
 					for (int i = 0; i < NX_ext; i++)
 					{
-						txx100[k][j][i] = stress_output_scale * (__half2float(h_txx[i + j * NX_ext + k * NX_ext * NY_ext]) + __half2float(h_txx_lo[i + j * NX_ext + k * NX_ext * NY_ext]));
+						txx100[k][j][i] = stress_output_scale * load_cr_host(h_txx, h_txx_lo, i + j * NX_ext + k * NX_ext * NY_ext);
 					}
 				}
 			}
@@ -1300,7 +1445,7 @@ int main()
 				{
 					for (int i = 0; i < NX_ext; i++)
 					{
-						txx150[k][j][i] = stress_output_scale * (__half2float(h_txx[i + j * NX_ext + k * NX_ext * NY_ext]) + __half2float(h_txx_lo[i + j * NX_ext + k * NX_ext * NY_ext]));
+						txx150[k][j][i] = stress_output_scale * load_cr_host(h_txx, h_txx_lo, i + j * NX_ext + k * NX_ext * NY_ext);
 					}
 				}
 			}
@@ -1311,7 +1456,7 @@ int main()
 				{
 					for (int i = 0; i < NX_ext; i++)
 					{
-						txx200[k][j][i] = stress_output_scale * (__half2float(h_txx[i + j * NX_ext + k * NX_ext * NY_ext]) + __half2float(h_txx_lo[i + j * NX_ext + k * NX_ext * NY_ext]));
+						txx200[k][j][i] = stress_output_scale * load_cr_host(h_txx, h_txx_lo, i + j * NX_ext + k * NX_ext * NY_ext);
 					}
 				}
 			}
@@ -1322,7 +1467,7 @@ int main()
 				{
 					for (int i = 0; i < NX_ext; i++)
 					{
-						txx250[k][j][i] = stress_output_scale * (__half2float(h_txx[i + j * NX_ext + k * NX_ext * NY_ext]) + __half2float(h_txx_lo[i + j * NX_ext + k * NX_ext * NY_ext]));
+						txx250[k][j][i] = stress_output_scale * load_cr_host(h_txx, h_txx_lo, i + j * NX_ext + k * NX_ext * NY_ext);
 					}
 				}
 			}
@@ -1333,7 +1478,7 @@ int main()
 				{
 					for (int i = 0; i < NX_ext; i++)
 					{
-						txx300[k][j][i] = stress_output_scale * (__half2float(h_txx[i + j * NX_ext + k * NX_ext * NY_ext]) + __half2float(h_txx_lo[i + j * NX_ext + k * NX_ext * NY_ext]));
+						txx300[k][j][i] = stress_output_scale * load_cr_host(h_txx, h_txx_lo, i + j * NX_ext + k * NX_ext * NY_ext);
 					}
 				}
 			}
@@ -1345,7 +1490,7 @@ int main()
 		{
 			for (int i = 0; i < NX_ext; i++)
 			{
-				txx[k][j][i] = stress_output_scale * (__half2float(h_txx[i + j * NX_ext + k * NX_ext * NY_ext]) + __half2float(h_txx_lo[i + j * NX_ext + k * NX_ext * NY_ext]));
+				txx[k][j][i] = stress_output_scale * load_cr_host(h_txx, h_txx_lo, i + j * NX_ext + k * NX_ext * NY_ext);
 			}
 		}
 	}
